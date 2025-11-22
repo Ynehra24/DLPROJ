@@ -1,61 +1,30 @@
-import os, re, random, json, math, time
-from collections import Counter
-import numpy as np
-import pandas as pd
-from tqdm import tqdm
-from PIL import Image
-
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, Sampler, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-
+from PIL import Image
+import pandas as pd
+import numpy as np
 from sklearn.preprocessing import LabelEncoder
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+from tqdm import tqdm
 
-# ----------------------------- CONFIG -----------------------------
-SEED = 42
+if torch.backends.mps.is_available():
+    DEVICE = torch.device("mps")
+elif torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+else:
+    DEVICE = torch.device("cpu")
+
+IMG_SIZE = 224
 MAX_LEN = 64
 BATCH_SIZE = 16
-EPOCHS = 20
+EPOCHS = 10
 LR = 2e-4
-IMG_SIZE = 224
-EMB_DIM = 512       # CLIP embedding dim
-TEXT_DIM = 512
-IMG_DIM = 512
-CLS_HIDDEN = 256
-MODEL_DIR = "./checkpoints_multimodal_fixed"
-os.makedirs(MODEL_DIR, exist_ok=True)
 
-TRAIN_FILES = [
-    "/Volumes/Extreme SSD/DL_Proj/CrisisMMD_v2.0/crisismmd_datasplit_all/task_damage_text_img_dev.tsv",
-    "/Volumes/Extreme SSD/DL_Proj/CrisisMMD_v2.0/crisismmd_datasplit_all/task_damage_text_img_train.tsv",
-]
-TEST_FILES = [
-    "/Volumes/Extreme SSD/DL_Proj/CrisisMMD_v2.0/crisismmd_datasplit_all/task_damage_text_img_test.tsv",
-]
-
-NUM_WORKERS = 0  # safe for notebooks / MPS
-PIN_MEMORY = True
-
-DEVICE = torch.device(
-    "cuda" if torch.cuda.is_available()
-    else "mps" if torch.backends.mps.is_available()
-    else "cpu"
-)
-print("Device:", DEVICE)
-
-# -------------------------- REPRO --------------------------
-def set_seed(seed=SEED):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
-set_seed()
-
-# ------------------------- UTILITIES ------------------------
 def clean_text(text):
+    import re
     text = str(text)
     text = re.sub(r"http\S+", "", text)
     text = re.sub(r"@\w+", "", text)
@@ -64,77 +33,12 @@ def clean_text(text):
     text = re.sub(r"\s+", " ", text).strip().lower()
     return text
 
-# cheap synonym map (small fallback)
-SYNONYM_MAP = {
-    "car": ["vehicle", "auto"],
-    "house": ["home", "residence"],
-    "flood": ["inundation"],
-    "fire": ["blaze"],
-    "collapsed": ["fell", "caved"],
-    "help": ["assist"],
-}
-
-def cheap_paraphrase(tokens, p_del=0.15, p_swap=0.1, p_syn=0.08, p_char_noise=0.03):
-    toks = [t for t in tokens if (random.random() > p_del or t == "<cls>")]
-    if len(toks) >= 2 and random.random() < p_swap:
-        i,j = random.sample(range(len(toks)), 2)
-        toks[i], toks[j] = toks[j], toks[i]
-    for i,t in enumerate(toks):
-        if random.random() < p_syn and t in SYNONYM_MAP:
-            toks[i] = random.choice(SYNONYM_MAP[t])
-    if random.random() < p_char_noise and len(toks) > 0:
-        i = random.randrange(len(toks))
-        w = toks[i]
-        pos = random.randrange(max(1, len(w)))
-        toks[i] = w[:pos] + random.choice("aeiou") + w[pos:]
-    return toks
-
-# optional googletrans fallback if installed
-TRANSLATOR = None
-TRANSLATOR_NAME = None
-try:
-    from googletrans import Translator as GoogleTranslator  # type: ignore
-    TRANSLATOR = GoogleTranslator()
-    TRANSLATOR_NAME = "googletrans"
-    print("googletrans available for optional BT (will be used if ENABLE_BT=True).")
-except Exception:
-    TRANSLATOR = None
-    TRANSLATOR_NAME = None
-
-def cheap_backtranslate(text, langs_chain=("fr","de")):
-    if TRANSLATOR is not None:
-        try:
-            cur = text
-            for lang in langs_chain:
-                cur = TRANSLATOR.translate(cur, dest=lang).text
-            cur = TRANSLATOR.translate(cur, dest="en").text
-            return clean_text(cur)
-        except Exception:
-            pass
-    toks = re.findall(r"\b[\w']+\b", text.lower())
-    toks2 = cheap_paraphrase(toks, p_del=0.12, p_swap=0.08, p_syn=0.1, p_char_noise=0.02)
-    return " ".join(toks2)
-
-# ------------------------- DATA ------------------------------
-def load_tsv(path):
-    df = pd.read_csv(path, sep="\t")
-    df["tweet_text"] = df["tweet_text"].astype(str).apply(clean_text)
-    return df
-
-train_df = pd.concat([load_tsv(p) for p in TRAIN_FILES], ignore_index=True)
-test_df = pd.concat([load_tsv(p) for p in TEST_FILES], ignore_index=True)
-
-label_le = LabelEncoder()
-train_df["label_id"] = label_le.fit_transform(train_df["label"])
-test_df["label_id"] = label_le.transform(test_df["label"])
-n_classes = len(label_le.classes_)
-print("Classes:", label_le.classes_.tolist())
-
-# ---------------------- VOCAB & TOKENIZER ---------------------
 def basic_tokenizer(text):
+    import re
     return re.findall(r"\b[\w']+\b", text.lower())
 
 def build_vocab(texts, min_freq=2):
+    from collections import Counter
     counter = Counter()
     for t in texts:
         counter.update(basic_tokenizer(t))
@@ -144,14 +48,7 @@ def build_vocab(texts, min_freq=2):
             vocab[w] = len(vocab)
     return vocab
 
-MIN_FREQ = 2
-vocab = build_vocab(train_df["tweet_text"].tolist(), min_freq=MIN_FREQ)
-vocab_size = len(vocab)
-print("Vocab size:", vocab_size)
-with open(os.path.join(MODEL_DIR, "vocab.json"), "w") as f:
-    json.dump(vocab, f, indent=2)
-
-def encode_text_ids(text, max_len=MAX_LEN):
+def encode_text_ids(text, vocab, max_len=MAX_LEN):
     toks = basic_tokenizer(text)[: max_len - 1]
     ids = [vocab.get(t, vocab["<unk>"]) for t in toks]
     ids = [vocab["<cls>"]] + ids
@@ -159,360 +56,181 @@ def encode_text_ids(text, max_len=MAX_LEN):
         ids += [vocab["<pad>"]] * (max_len - len(ids))
     return ids[:max_len]
 
-# --------------------- IMAGE AUGMENTATION ---------------------
-img_train_transform = transforms.Compose([
-    transforms.RandomResizedCrop(IMG_SIZE, scale=(0.6,1.0)),
-    transforms.RandomHorizontalFlip(p=0.5),
-    transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.05),
-    transforms.RandomRotation(10),
-    transforms.ToTensor(),
-    transforms.RandomErasing(p=0.25),
-    transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
-])
-
-img_test_transform = transforms.Compose([
-    transforms.Resize((IMG_SIZE, IMG_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
-])
-
-# --------------------- DATASET -------------------------------
-class MultimodalDataset(Dataset):
-    def __init__(self, df, do_aug=False, enable_bt=False, bt_prob=0.05):
+class TweetDataset(Dataset):
+    def __init__(self, df, vocab, label_encoder, img_transform, max_len=MAX_LEN):
         self.df = df.reset_index(drop=True)
-        self.do_aug = do_aug
-        self.enable_bt = enable_bt
-        self.bt_prob = bt_prob
-    def __len__(self): return len(self.df)
+        self.vocab = vocab
+        self.label_encoder = label_encoder
+        self.img_transform = img_transform
+        self.max_len = max_len
+    def __len__(self):
+        return len(self.df)
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
-        text = row["tweet_text"]
-        if self.do_aug:
-            if self.enable_bt and TRANSLATOR is not None and random.random() < self.bt_prob:
-                text = cheap_backtranslate(text)
-            else:
-                toks = basic_tokenizer(text)
-                toks = cheap_paraphrase(toks, p_del=0.12, p_swap=0.08, p_syn=0.06, p_char_noise=0.02)
-                text = " ".join(toks)
-        text_ids = torch.tensor(encode_text_ids(text), dtype=torch.long)
-
-        img_path = row.get("image", None)
+        text_ids = torch.tensor(encode_text_ids(row["tweet_text"], self.vocab, self.max_len), dtype=torch.long)
         try:
-            img = Image.open(img_path).convert("RGB")
+            img = Image.open(row["image_path"]).convert("RGB")
         except Exception:
             img = Image.new("RGB", (IMG_SIZE, IMG_SIZE), (0,0,0))
-
-        img = img_train_transform(img) if self.do_aug else img_test_transform(img)
-
-        label = torch.tensor(row["label_id"], dtype=torch.long)
+        img = self.img_transform(img)
+        label = torch.tensor(self.label_encoder.transform([row["label"]])[0], dtype=torch.long)
         return {"text_ids": text_ids, "image": img, "label": label}
 
-train_dataset = MultimodalDataset(train_df, do_aug=True, enable_bt=False, bt_prob=0.05)
-test_dataset = MultimodalDataset(test_df, do_aug=False, enable_bt=False)
-
-# ---------------- Balanced sampling (weighted) ----------------
-counts = train_df["label_id"].value_counts().sort_index()
-weights_per_class = 1.0 / torch.sqrt(torch.tensor(counts.values, dtype=torch.float) + 1e-6)
-sample_weights = [weights_per_class[int(l)] for l in train_df["label_id"].tolist()]
-sampler = WeightedRandomSampler(sample_weights, len(sample_weights), replacement=True)
-
-train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler,
-                          num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
-test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False,
-                         num_workers=NUM_WORKERS, pin_memory=PIN_MEMORY)
-
-# ----------------------- MODEL: CLIP-style encoders -----------------------
-# Text encoder: small Transformer stack
-class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_head, d_ff, dropout=0.1):
-        super().__init__()
-        self.attn = nn.MultiheadAttention(d_model, n_head, batch_first=True, dropout=dropout)
-        self.ff = nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(), nn.Linear(d_ff, d_model))
-        self.ln1 = nn.LayerNorm(d_model)
-        self.ln2 = nn.LayerNorm(d_model)
-    def forward(self, x, mask=None):
-        attn_out = self.attn(x, x, x, key_padding_mask=mask)[0]
-        x = self.ln1(x + attn_out)
-        x = self.ln2(x + self.ff(x))
-        return x
-
 class TextEncoder(nn.Module):
-    def __init__(self, vocab_size, d_model=TEXT_DIM, n_head=8, n_layers=4, d_ff=1024, max_len=MAX_LEN):
+    def __init__(self, vocab_size, d_model=256, n_head=4, n_layers=2, d_ff=512, max_len=MAX_LEN, out_dim=256):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, d_model, padding_idx=1)
         self.pos = nn.Parameter(torch.randn(1, max_len, d_model) * 0.01)
-        self.layers = nn.ModuleList([TransformerBlock(d_model, n_head, d_ff) for _ in range(n_layers)])
+        self.layers = nn.ModuleList([
+            nn.TransformerEncoderLayer(d_model, n_head, d_ff, batch_first=True)
+            for _ in range(n_layers)
+        ])
         self.norm = nn.LayerNorm(d_model)
-        self.project = nn.Linear(d_model, EMB_DIM)
+        self.project = nn.Linear(d_model, out_dim)
     def forward(self, ids):
-        mask = ids.eq(1)  # padding index
         x = self.emb(ids) + self.pos[:, :ids.size(1), :]
         for l in self.layers:
-            x = l(x, mask)
+            x = l(x)
         pooled = self.norm(x[:,0])
-        out = self.project(pooled)   # EMB_DIM
+        out = self.project(pooled)
         out = F.normalize(out, dim=-1)
         return out
 
-# Image encoder: small convnet -> projection (acts like CLIP visual encoder)
 class ImageEncoder(nn.Module):
-    def __init__(self, out_dim=EMB_DIM):
+    def __init__(self, out_dim=256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Conv2d(3, 64, 7, stride=2, padding=3), nn.BatchNorm2d(64), nn.ReLU(),
-            nn.MaxPool2d(3, stride=2, padding=1),
-            nn.Conv2d(64, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
-            nn.Conv2d(128, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
+            nn.Conv2d(3, 32, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.ReLU(),
             nn.AdaptiveAvgPool2d(1)
         )
-        self.proj = nn.Linear(256, out_dim)
+        self.fc = nn.Linear(128, out_dim)
     def forward(self, x):
-        f = self.net(x).view(x.size(0), -1)
-        out = self.proj(f)
-        out = F.normalize(out, dim=-1)
-        return out
+        x = self.net(x).view(x.size(0), -1)
+        x = self.fc(x)
+        x = F.normalize(x, dim=-1)
+        return x
 
-# Fusion classifier: uses concatenated CLIP embeddings (text+img) and classification head
-class MultimodalClassifier(nn.Module):
-    def __init__(self, vocab_size, n_classes, use_image=True):
+class MultiModalClassifier(nn.Module):
+    def __init__(self, vocab_size, n_classes):
         super().__init__()
-        self.use_image = use_image
         self.text_enc = TextEncoder(vocab_size)
-        self.img_enc = ImageEncoder() if use_image else None
-        # classification head
-        feat_dim = EMB_DIM * (2 if use_image else 1)
+        self.img_enc = ImageEncoder()
         self.cls = nn.Sequential(
-            nn.Linear(feat_dim, CLS_HIDDEN),
+            nn.Linear(512, 128),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(CLS_HIDDEN, n_classes)
+            nn.Linear(128, n_classes)
         )
-        self.temp = nn.Parameter(torch.tensor(1.0))
-    def forward(self, ids, images=None, logit_adjust=None):
-        t = self.text_enc(ids)
-        if self.use_image:
-            if images is None:
-                raise ValueError("Model configured with image encoder but no images were passed.")
-            v = self.img_enc(images)
-            fused = torch.cat([t, v], dim=1)
-        else:
-            fused = t
-        logits = self.cls(fused)
-        if logit_adjust is not None:
-            logits = logits + logit_adjust
-        return logits, t, (v if self.use_image else None)
+    def forward(self, text_ids, images):
+        t = self.text_enc(text_ids)
+        v = self.img_enc(images)
+        x = torch.cat([t, v], dim=1)
+        logits = self.cls(x)
+        return logits
 
-model = MultimodalClassifier(vocab_size=vocab_size, n_classes=n_classes, use_image=True).to(DEVICE)
-print("Model parameters:", sum(p.numel() for p in model.parameters()))
-
-# ------------------------- LOSSES -------------------------------------
-class FocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=None):
-        super().__init__()
-        self.gamma = gamma
-        if alpha is not None:
-            self.alpha = torch.tensor(alpha, dtype=torch.float32)
-        else:
-            self.alpha = None
-    def forward(self, logits, targets):
-        ce = F.cross_entropy(logits, targets, reduction="none")
-        pt = torch.exp(-ce)
-        focal = ((1 - pt) ** self.gamma) * ce
-        if self.alpha is not None:
-            alpha = self.alpha.to(logits.device)
-            at = alpha[targets]
-            focal = focal * at
-        return focal.mean()
-
-# compute class alpha from training counts (inverse sqrt)
-class_counts = train_df["label_id"].value_counts().sort_index().values
-alpha = (1.0 / np.sqrt(class_counts + 1e-6))
-alpha = alpha / alpha.sum() * len(alpha)
-focal_criterion = FocalLoss(gamma=2.0, alpha=alpha)
-
-# optional contrastive loss between text and image
-class NTXent(nn.Module):
-    def __init__(self, temp=0.07):
-        super().__init__()
-        self.t = temp
-    def forward(self, z1, z2):
-        B = z1.size(0)
-        z = torch.cat([z1, z2], dim=0)  # 2B x D
-        sim = torch.matmul(z, z.t()) / self.t
-        mask = torch.eye(2*B, device=z.device).bool()
-        sim = sim.masked_fill(mask, -9e15)
-        positives = torch.exp((z1 * z2).sum(dim=1)/self.t)
-        positives = torch.cat([positives, positives], dim=0)
-        exp_sim = torch.exp(sim)
-        denom = exp_sim.sum(dim=1)
-        loss = -torch.log(positives / denom)
-        return loss.mean()
-
-ntxent = NTXent(temp=0.07)
-
-# ----------------------- OPTIMIZER / SCHEDULER -----------------------
-optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-5)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS)
-
-# ------------------------ EVALUATION FUNC ----------------------------
-def evaluate(model, loader, logit_adjust=None):
-    model.eval()
-    preds = []
-    trues = []
-    with torch.no_grad():
-        for b in loader:
-            ids = b["text_ids"].to(DEVICE)
-            imgs = b["image"].to(DEVICE)
-            y = b["label"].to(DEVICE)
-            logits, _, _ = model(ids, imgs, logit_adjust)
-            p = logits.argmax(1).cpu().numpy()
-            preds.extend(p.tolist())
-            trues.extend(y.cpu().numpy().tolist())
-    acc = accuracy_score(trues, preds)
-    return acc, trues, preds
-
-# ---------------- hard example collector (text-only misclassified minority samples) -----------
-def collect_hard_examples_minority(model, dataset, minority_set, limit=2000):
-    model.eval()
-    xs, ys = [], []
-    loader = DataLoader(dataset, batch_size=256, shuffle=False, num_workers=NUM_WORKERS)
-    with torch.no_grad():
-        for b in loader:
-            x = b["text_ids"].to(DEVICE)
-            y = b["label"].to(DEVICE)
-            # forward only text branch to produce preds (safe)
-            logits, _, _ = model(x, images=torch.zeros((x.size(0),3,IMG_SIZE,IMG_SIZE), device=DEVICE), logit_adjust=None) if model.use_image else model(x, images=None)
-            preds = logits.argmax(1)
-            mask = preds != y
-            for i_val, m in enumerate(mask.cpu().numpy()):
-                if not m:
-                    continue
-                yi = int(y.cpu()[i_val].item())
-                if yi in minority_set:
-                    xs.append(x[i_val].cpu().unsqueeze(0))
-                    ys.append(y[i_val].cpu().unsqueeze(0))
-    if not xs:
-        return None, None
-    xh = torch.cat(xs)[:limit]
-    yh = torch.cat(ys)[:limit]
-    return xh, yh
-
-# ------------------------- TRAIN LOOP -------------------------------
-best_acc = 0.0
-# initial logit adjust (weak) - helps boosting minority logits slightly
-samples = train_df["label_id"].value_counts().sort_index().values.astype(np.int64)
-priors = samples / samples.sum()
-logit_adjust = torch.log(1.0 / (torch.tensor(priors, dtype=torch.float32) + 1e-12)).to(DEVICE)
-logit_adjust = (logit_adjust - logit_adjust.mean()) * 0.5  # moderate adjustment
-
-for epoch in range(1, EPOCHS+1):
+def train_epoch(model, loader, optimizer, criterion):
     model.train()
-    tot_loss = 0.0
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{EPOCHS}")
+    total_loss = 0
+    pbar = tqdm(loader, desc="Training", leave=False)
     for batch in pbar:
-        ids = batch["text_ids"].to(DEVICE)
-        imgs = batch["image"].to(DEVICE)
-        y = batch["label"].to(DEVICE)
-
+        text_ids = batch["text_ids"].to(DEVICE)
+        images = batch["image"].to(DEVICE)
+        labels = batch["label"].to(DEVICE)
         optimizer.zero_grad()
-        logits, t_emb, v_emb = model(ids, imgs, logit_adjust)
-
-        cls_loss = focal_criterion(logits, y)
-
-        # small alignment loss so text+image embeddings align; helps fusion
-        contra_loss = ntxent(t_emb, v_emb) * 0.1
-
-        loss = cls_loss + contra_loss
+        logits = model(text_ids, images)
+        loss = criterion(logits, labels)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
+        total_loss += loss.item()
+        pbar.set_postfix(loss=total_loss / (pbar.n + 1e-12))
+    return total_loss / len(loader)
 
-        tot_loss += float(loss.item())
-        pbar.set_postfix(loss=tot_loss / (pbar.n + 1e-12))
+def evaluate(model, loader):
+    model.eval()
+    preds, trues = [], []
+    total_loss = 0
+    criterion = nn.CrossEntropyLoss()
+    pbar = tqdm(loader, desc="Validation", leave=False)
+    with torch.no_grad():
+        for batch in pbar:
+            text_ids = batch["text_ids"].to(DEVICE)
+            images = batch["image"].to(DEVICE)
+            labels = batch["label"].to(DEVICE)
+            logits = model(text_ids, images)
+            loss = criterion(logits, labels)
+            total_loss += loss.item()
+            pred = logits.argmax(1).cpu().numpy()
+            preds.extend(pred.tolist())
+            trues.extend(labels.cpu().numpy().tolist())
+            pbar.set_postfix(loss=total_loss / (pbar.n + 1e-12))
+    acc = np.mean(np.array(preds) == np.array(trues))
+    return acc, preds, trues
 
-    scheduler.step()
+if __name__ == "__main__":
+    train_val_files = [
+        ("/Volumes/Extreme SSD/DL_Proj/CrisisMMD_v2.0/crisismmd_datasplit_all/task_damage_text_img_train.tsv", "damage"),
+        ("/Volumes/Extreme SSD/DL_Proj/CrisisMMD_v2.0/crisismmd_datasplit_all/task_damage_text_img_dev.tsv", "damage"),
+        ("/Volumes/Extreme SSD/DL_Proj/CrisisMMD_v2.0/crisismmd_datasplit_all/task_informative_text_img_train.tsv", "informative"),
+        ("/Volumes/Extreme SSD/DL_Proj/CrisisMMD_v2.0/crisismmd_datasplit_all/task_informative_text_img_dev.tsv", "informative"),
+        ("/Volumes/Extreme SSD/DL_Proj/CrisisMMD_v2.0/crisismmd_datasplit_all/task_humanitarian_text_img_train.tsv", "humanitarian"),
+        ("/Volumes/Extreme SSD/DL_Proj/CrisisMMD_v2.0/crisismmd_datasplit_all/task_humanitarian_text_img_dev.tsv", "humanitarian")
+    ]
+    train_dfs, val_dfs = [], []
+    for path, label in train_val_files:
+        df = pd.read_csv(path, sep="\t")
+        df["tweet_text"] = df["tweet_text"].astype(str).apply(clean_text)
+        df["label"] = label
+        if "train" in path:
+            train_dfs.append(df)
+        else:
+            val_dfs.append(df)
+    train_df = pd.concat(train_dfs, ignore_index=True)
+    val_df = pd.concat(val_dfs, ignore_index=True)
+    label_encoder = LabelEncoder()
+    all_labels = pd.concat([train_df["label"], val_df["label"]], ignore_index=True)
+    label_encoder.fit(all_labels)
+    n_classes = len(label_encoder.classes_)
+    vocab = build_vocab(train_df["tweet_text"].tolist(), min_freq=2)
+    vocab_size = len(vocab)
+    img_transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
+    ])
+    train_ds = TweetDataset(train_df, vocab, label_encoder, img_transform)
+    val_ds = TweetDataset(val_df, vocab, label_encoder, img_transform)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+    model = MultiModalClassifier(vocab_size, n_classes).to(DEVICE)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
+    criterion = nn.CrossEntropyLoss()
+    for epoch in range(1, EPOCHS+1):
+        loss = train_epoch(model, train_loader, optimizer, criterion)
+        acc, _, _ = evaluate(model, val_loader)
+        print(f"Epoch {epoch}: Loss={loss:.4f} | Val Acc={acc:.4f}")
+    torch.save({
+        "model_state": model.state_dict(),
+        "vocab": vocab,
+        "label_encoder": label_encoder.classes_
+    }, "multimodal_tweet_model.pt")
+    print("Training complete.")
 
-    val_acc, val_trues, val_preds = evaluate(model, test_loader, logit_adjust)
-    print(f"\nEpoch {epoch} | Val Acc: {val_acc:.4f}")
-    print(classification_report(val_trues, val_preds, target_names=label_le.classes_, zero_division=0))
-    print("Confusion Matrix:\n", confusion_matrix(val_trues, val_preds))
-
-    # adjust logit_adjust mildly based on class recall
-    report = classification_report(val_trues, val_preds, output_dict=True, zero_division=0)
-    recs = []
-    for i, cls in enumerate(label_le.classes_):
-        rec = report.get(cls, {}).get("recall", 0.0)
-        recs.append(rec)
-    recs = np.array(recs)
-    adjust = (1.0 - recs)
-    adjust_t = torch.tensor(adjust, dtype=torch.float32, device=DEVICE)
-    logit_adjust = logit_adjust + (adjust_t - adjust_t.mean()) * 0.2
-    logit_adjust = torch.clamp(logit_adjust, -4.0, 4.0)
-
-    # Hard example mining: TEXT-ONLY retraining for minority misclassified samples
-    # Collect misclassified minority text-only samples (no image required)
-    minority_set = set(np.where(samples < samples.mean())[0].tolist())
-    hard_x, hard_y = collect_hard_examples_minority(model, train_dataset, minority_set, limit=2000)
-    if hard_x is not None:
-        hard_x = hard_x.to(DEVICE)
-        hard_y = hard_y.to(DEVICE)
-        print(f"Retrying {len(hard_x)} minority hard samples (text-only) for 1 pass")
-        model.train()
-        CH = 256
-        idx = 0
-        total_hloss = 0.0
-        it_h = 0
-        while idx < len(hard_x):
-            xb = hard_x[idx: idx+CH]
-            yb = hard_y[idx: idx+CH]
-            optimizer.zero_grad()
-            # --- FIXED: use text encoder + classifier only (no images) ---
-            with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
-                z = model.text_enc(xb)
-                logits_h = model.cls(torch.cat([z, torch.zeros_like(z)], dim=1)) if model.use_image else model.cls(z)
-                # if model.use_image we concatenated zeros for the image part; classifier shape matches
-                y_soft = F.one_hot(yb, num_classes=n_classes).float() * 0.0
-                # build soft targets (slightly smoothed)
-                y_soft = y_soft + (1.0 / n_classes) * 0.05
-                for i in range(y_soft.size(0)):
-                    y_soft[i, yb[i]] = 0.95
-                hloss = F.kl_div(F.log_softmax(logits_h, dim=1), y_soft.to(logits_h.device), reduction="batchmean")
-            hloss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            total_hloss += float(hloss.item())
-            it_h += 1
-            idx += CH
-        if it_h > 0:
-            print(f"  Hard pass loss: {total_hloss/it_h:.4f}")
-
-    # save best
-    if val_acc > best_acc:
-        best_acc = val_acc
-        torch.save({
-            "model_state": model.state_dict(),
-            "vocab": vocab,
-            "epoch": epoch,
-            "logit_adjust": logit_adjust.cpu().numpy()
-        }, os.path.join(MODEL_DIR, "best_multimodal_fixed.pt"))
-        print("Saved best model.")
-
-print("Training complete. Best val acc:", best_acc)
-
-# -------------------- Minimal test runnable when module imported --------------------
-def load_and_eval(checkpoint_path, test_tsv=None):
-    ckpt = torch.load(checkpoint_path, map_location=DEVICE)
-    model_local = MultimodalClassifier(vocab_size=len(ckpt["vocab"]), n_classes=len(label_le.classes_), use_image=True).to(DEVICE)
-    model_local.load_state_dict(ckpt["model_state"])
-    model_local.eval()
-    if test_tsv is not None:
-        df_test = pd.read_csv(test_tsv, sep="\t")
-        df_test["tweet_text"] = df_test["tweet_text"].astype(str).apply(clean_text)
-        ds = MultimodalDataset(df_test, do_aug=False)
-        loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
-        acc, trues, preds = evaluate(model_local, loader)
-        print("Loaded checkpoint acc:", acc)
-        print(classification_report(trues, preds, target_names=label_le.classes_))
-    return model_local
-
-# End of file
+def predict_tweet(model, tweet_text, image_path, vocab, label_encoder):
+    model.eval()
+    text = clean_text(tweet_text)
+    text_ids = torch.tensor([encode_text_ids(text, vocab)], dtype=torch.long).to(DEVICE)
+    try:
+        img = Image.open(image_path).convert("RGB")
+    except Exception:
+        img = Image.new("RGB", (IMG_SIZE, IMG_SIZE), (0,0,0))
+    img_transform = transforms.Compose([
+        transforms.Resize((IMG_SIZE, IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
+    ])
+    img = img_transform(img).unsqueeze(0).to(DEVICE)
+    with torch.no_grad():
+        logits = model(text_ids, img)
+        pred = logits.argmax(1).item()
+    return label_encoder[pred]
