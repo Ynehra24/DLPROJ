@@ -19,9 +19,10 @@ else:
 
 IMG_SIZE = 224
 MAX_LEN = 64
-BATCH_SIZE = 16
-EPOCHS = 10
+BATCH_SIZE = 32
+EPOCHS = 15
 LR = 2e-4
+EMB_DIM = 512
 
 def clean_text(text):
     import re
@@ -76,51 +77,62 @@ class TweetDataset(Dataset):
         label = torch.tensor(self.label_encoder.transform([row["label"]])[0], dtype=torch.long)
         return {"text_ids": text_ids, "image": img, "label": label}
 
+class TransformerBlock(nn.Module):
+    def __init__(self, d_model, n_head, d_ff, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_head, batch_first=True, dropout=dropout)
+        self.ff = nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(), nn.Linear(d_ff, d_model))
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ln2 = nn.LayerNorm(d_model)
+    def forward(self, x, mask=None):
+        attn_out = self.attn(x, x, x, key_padding_mask=mask)[0]
+        x = self.ln1(x + attn_out)
+        x = self.ln2(x + self.ff(x))
+        return x
+
 class TextEncoder(nn.Module):
-    def __init__(self, vocab_size, d_model=256, n_head=4, n_layers=2, d_ff=512, max_len=MAX_LEN, out_dim=256):
+    def __init__(self, vocab_size, d_model=EMB_DIM, n_head=8, n_layers=4, d_ff=1024, max_len=MAX_LEN):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, d_model, padding_idx=1)
         self.pos = nn.Parameter(torch.randn(1, max_len, d_model) * 0.01)
-        self.layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(d_model, n_head, d_ff, batch_first=True)
-            for _ in range(n_layers)
-        ])
+        self.layers = nn.ModuleList([TransformerBlock(d_model, n_head, d_ff) for _ in range(n_layers)])
         self.norm = nn.LayerNorm(d_model)
-        self.project = nn.Linear(d_model, out_dim)
+        self.project = nn.Linear(d_model, EMB_DIM)
     def forward(self, ids):
+        mask = ids.eq(1)
         x = self.emb(ids) + self.pos[:, :ids.size(1), :]
         for l in self.layers:
-            x = l(x)
+            x = l(x, mask)
         pooled = self.norm(x[:,0])
         out = self.project(pooled)
         out = F.normalize(out, dim=-1)
         return out
 
 class ImageEncoder(nn.Module):
-    def __init__(self, out_dim=256):
+    def __init__(self, out_dim=EMB_DIM):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(3, 32, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(32, 64, 3, stride=2, padding=1), nn.ReLU(),
-            nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1)
-        )
-        self.fc = nn.Linear(128, out_dim)
+        from torchvision.models import resnet18
+        base = resnet18(weights=None)
+        base.conv1 = nn.Conv2d(3, 64, 3, stride=2, padding=1, bias=False)
+        base.maxpool = nn.Identity()
+        self.base = nn.Sequential(*list(base.children())[:-1])
+        self.proj = nn.Linear(512, out_dim)
     def forward(self, x):
-        x = self.net(x).view(x.size(0), -1)
-        x = self.fc(x)
-        x = F.normalize(x, dim=-1)
-        return x
+        f = self.base(x).view(x.size(0), -1)
+        out = self.proj(f)
+        out = F.normalize(out, dim=-1)
+        return out
 
-class MultiModalClassifier(nn.Module):
+class MultiModalCLIP(nn.Module):
     def __init__(self, vocab_size, n_classes):
         super().__init__()
         self.text_enc = TextEncoder(vocab_size)
         self.img_enc = ImageEncoder()
         self.cls = nn.Sequential(
-            nn.Linear(512, 128),
+            nn.Linear(EMB_DIM*2, 256),
             nn.ReLU(),
-            nn.Linear(128, n_classes)
+            nn.Dropout(0.3),
+            nn.Linear(256, n_classes)
         )
     def forward(self, text_ids, images):
         t = self.text_enc(text_ids)
@@ -129,43 +141,20 @@ class MultiModalClassifier(nn.Module):
         logits = self.cls(x)
         return logits
 
-def train_epoch(model, loader, optimizer, criterion):
-    model.train()
-    total_loss = 0
-    pbar = tqdm(loader, desc="Training", leave=False)
-    for batch in pbar:
-        text_ids = batch["text_ids"].to(DEVICE)
-        images = batch["image"].to(DEVICE)
-        labels = batch["label"].to(DEVICE)
-        optimizer.zero_grad()
-        logits = model(text_ids, images)
-        loss = criterion(logits, labels)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-        pbar.set_postfix(loss=total_loss / (pbar.n + 1e-12))
-    return total_loss / len(loader)
-
-def evaluate(model, loader):
-    model.eval()
-    preds, trues = [], []
-    total_loss = 0
-    criterion = nn.CrossEntropyLoss()
-    pbar = tqdm(loader, desc="Validation", leave=False)
-    with torch.no_grad():
-        for batch in pbar:
-            text_ids = batch["text_ids"].to(DEVICE)
-            images = batch["image"].to(DEVICE)
-            labels = batch["label"].to(DEVICE)
-            logits = model(text_ids, images)
-            loss = criterion(logits, labels)
-            total_loss += loss.item()
-            pred = logits.argmax(1).cpu().numpy()
-            preds.extend(pred.tolist())
-            trues.extend(labels.cpu().numpy().tolist())
-            pbar.set_postfix(loss=total_loss / (pbar.n + 1e-12))
-    acc = np.mean(np.array(preds) == np.array(trues))
-    return acc, preds, trues
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2.0, alpha=None):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = torch.tensor(alpha, dtype=torch.float32) if alpha is not None else None
+    def forward(self, logits, targets):
+        ce = F.cross_entropy(logits, targets, reduction="none")
+        pt = torch.exp(-ce)
+        focal = ((1 - pt) ** self.gamma) * ce
+        if self.alpha is not None:
+            alpha = self.alpha.to(logits.device)
+            at = alpha[targets]
+            focal = focal * at
+        return focal.mean()
 
 if __name__ == "__main__":
     train_val_files = [
@@ -193,27 +182,64 @@ if __name__ == "__main__":
     n_classes = len(label_encoder.classes_)
     vocab = build_vocab(train_df["tweet_text"].tolist(), min_freq=2)
     vocab_size = len(vocab)
-    img_transform = transforms.Compose([
+    img_train_transform = transforms.Compose([
+        transforms.RandomResizedCrop(IMG_SIZE, scale=(0.6,1.0)),
+        transforms.RandomHorizontalFlip(p=0.5),
+        transforms.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.05),
+        transforms.RandomRotation(10),
+        transforms.ToTensor(),
+        transforms.RandomErasing(p=0.25),
+        transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
+    ])
+    img_val_transform = transforms.Compose([
         transforms.Resize((IMG_SIZE, IMG_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485,0.456,0.406], std=[0.229,0.224,0.225]),
     ])
-    train_ds = TweetDataset(train_df, vocab, label_encoder, img_transform)
-    val_ds = TweetDataset(val_df, vocab, label_encoder, img_transform)
+    train_ds = TweetDataset(train_df, vocab, label_encoder, img_train_transform)
+    val_ds = TweetDataset(val_df, vocab, label_encoder, img_val_transform)
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
-    model = MultiModalClassifier(vocab_size, n_classes).to(DEVICE)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LR)
-    criterion = nn.CrossEntropyLoss()
+    model = MultiModalCLIP(vocab_size, n_classes).to(DEVICE)
+    class_counts = train_df["label"].value_counts().sort_index().values
+    alpha = (1.0 / np.sqrt(class_counts + 1e-6))
+    alpha = alpha / alpha.sum() * len(alpha)
+    criterion = FocalLoss(gamma=2.0, alpha=alpha)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-5)
     for epoch in range(1, EPOCHS+1):
-        loss = train_epoch(model, train_loader, optimizer, criterion)
-        acc, _, _ = evaluate(model, val_loader)
-        print(f"Epoch {epoch}: Loss={loss:.4f} | Val Acc={acc:.4f}")
+        model.train()
+        total_loss = 0
+        pbar = tqdm(train_loader, desc=f"Train Epoch {epoch}")
+        for batch in pbar:
+            text_ids = batch["text_ids"].to(DEVICE)
+            images = batch["image"].to(DEVICE)
+            labels = batch["label"].to(DEVICE)
+            optimizer.zero_grad()
+            logits = model(text_ids, images)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+            pbar.set_postfix(loss=total_loss / (pbar.n + 1e-12))
+        model.eval()
+        preds, trues = [], []
+        with torch.no_grad():
+            pbar = tqdm(val_loader, desc=f"Val Epoch {epoch}")
+            for batch in pbar:
+                text_ids = batch["text_ids"].to(DEVICE)
+                images = batch["image"].to(DEVICE)
+                labels = batch["label"].to(DEVICE)
+                logits = model(text_ids, images)
+                pred = logits.argmax(1).cpu().numpy()
+                preds.extend(pred.tolist())
+                trues.extend(labels.cpu().numpy().tolist())
+        acc = np.mean(np.array(preds) == np.array(trues))
+        print(f"Epoch {epoch}: Val Acc={acc:.4f}")
     torch.save({
         "model_state": model.state_dict(),
         "vocab": vocab,
         "label_encoder": label_encoder.classes_
-    }, "multimodal_tweet_model.pt")
+    }, "multimodal_clip_model.pt")
     print("Training complete.")
 
 def predict_tweet(model, tweet_text, image_path, vocab, label_encoder):
