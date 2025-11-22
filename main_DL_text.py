@@ -249,39 +249,45 @@ class MultimodalMultiTask(nn.Module):
 # ---------- Loss and training helpers ----------
 
 def compute_masked_losses(outputs, labels, device):
-    # labels are tensors with -1 for missing
+    loss = torch.tensor(0.0, device=device, requires_grad=True)
     losses = {}
-    loss = 0.0
+
     # Task1 BCE
     t1_mask = labels['t1'] >= 0
     if t1_mask.any():
         t1_logits = outputs['t1_logits'][t1_mask]
         t1_target = labels['t1'][t1_mask].float().to(device)
         l1 = F.binary_cross_entropy_with_logits(t1_logits, t1_target)
-        losses['t1'] = l1.item()
-        loss += l1
+        losses['t1'] = float(l1.detach().cpu())
+        loss = loss + l1
+
     # Task2 CE
     t2_mask = labels['t2'] >= 0
     if t2_mask.any():
         t2_logits = outputs['t2_logits'][t2_mask]
         t2_target = labels['t2'][t2_mask].to(device)
         l2 = F.cross_entropy(t2_logits, t2_target)
-        losses['t2'] = l2.item()
-        loss += l2
-    # Task3 (structure & severity) masked
+        losses['t2'] = float(l2.detach().cpu())
+        loss = loss + l2
+
+    # Task3 (structure & severity)
     t3_mask = labels['t3a'] >= 0
     if t3_mask.any():
         l3a = F.cross_entropy(outputs['t3a_logits'][t3_mask], labels['t3a'][t3_mask].to(device))
         l3b = F.cross_entropy(outputs['t3b_logits'][t3_mask], labels['t3b'][t3_mask].to(device))
-        losses['t3a'] = l3a.item(); losses['t3b'] = l3b.item()
-        loss += 0.8 * (l3a + l3b)
-    # Task4 masked
+        losses['t3a'] = float(l3a.detach().cpu())
+        losses['t3b'] = float(l3b.detach().cpu())
+        loss = loss + 0.8 * (l3a + l3b)
+
+    # Task4
     t4_mask = labels['t4'] >= 0
     if t4_mask.any():
         l4 = F.cross_entropy(outputs['t4_logits'][t4_mask], labels['t4'][t4_mask].to(device))
-        losses['t4'] = l4.item()
-        loss += 0.8 * l4
+        losses['t4'] = float(l4.detach().cpu())
+        loss = loss + 0.8 * l4
+
     return loss, losses
+
 
 # ---------- Metrics ----------
 from collections import defaultdict
@@ -403,8 +409,7 @@ def evaluate(model: nn.Module, loader: DataLoader, device):
 # ---------- Main runner ----------
 
 def build_dataloaders(data_cfg, clip_model_name, batch_size):
-    # use fast tokenizer/processor when available to avoid the "slow processor" warning
-    processor = CLIPProcessor.from_pretrained(clip_model_name, use_fast=True)
+    processor = CLIPProcessor.from_pretrained(clip_model_name)
     image_transforms = transforms.Compose([
         transforms.Resize((256,256)),
         transforms.RandomCrop(224),
