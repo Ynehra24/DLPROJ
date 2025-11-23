@@ -1,23 +1,25 @@
 import os
 import time
 import argparse
-from typing import List, Dict, Any, Optional, Tuple
-from collections import Counter, defaultdict
+from typing import List, Dict, Any, Optional
+from collections import Counter
 from pathlib import Path
-
-import numpy as np
 from PIL import Image
+import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from tqdm.auto import tqdm
 
 from transformers import CLIPProcessor, CLIPModel, get_cosine_schedule_with_warmup
+from tqdm.auto import tqdm
 
-PAPER_PATH = "/mnt/data/emnlp.pdf"  
-
+if torch.backends.mps.is_available():
+    DEVICE = "mps"
+    os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+else:
+    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DATA_CONFIG = {
     'task1': {
         'train_tsv': '/Volumes/Extreme SSD/DL_Proj/CrisisMMD_v2.0/crisismmd_datasplit_all/task_damage_text_img_train.tsv',
@@ -37,31 +39,25 @@ DEFAULTS = {
     'clip_model': 'openai/clip-vit-base-patch32',
     'batch_size': 32,
     'epochs': 12,
-    'lr': 5e-5,
-    'device': 'cuda' if torch.cuda.is_available() else 'cpu',
-    'save_dir': 'checkpoints_improved',
+    'lr': 5e-4,
+    'device': DEVICE,
+    'save_dir': 'checkpoints_final',
     'max_text_len': 77,
-    'num_workers': 4,
-    'pin_memory': False,
-    'image_size': 224,
-    'warmup_frac': 0.03,
-    'unfreeze_last_n_clip_layers': 2,
-    'use_focal': False,
-    'focal_gamma': 2.0,
-    'weight_decay': 1e-2,
-    'grad_clip': 1.0,
-    'amp': True, 
-    'gate_by_t1': True  
+    'num_workers': 0,
+    'pin_memory': False
 }
 
+TARGET_IMAGE_SIZE = (224, 224)
 
 DAMAGE_MAP = {
     'little_or_no_damage': 0,
     'mild_damage': 1,
     'severe_damage': 2
 }
-BINARY_MAP = {'negative': 0, 'positive': 1}
-
+BINARY_MAP = {
+    'negative': 0,
+    'positive': 1
+}
 
 def safe_str(x):
     if x is None:
@@ -70,21 +66,23 @@ def safe_str(x):
         return x.strip()
     return str(x).strip()
 
+
 def detect_column(header: List[str], candidates: List[str]) -> Optional[str]:
     for c in candidates:
         if c in header:
             return c
     return None
 
-def scan_and_print_distribution(path: str, col: str) -> Counter:
+
+def scan_and_print_distribution(path: str, col: str):
     ctr = Counter()
     if not os.path.exists(path):
         return ctr
     with open(path, 'r', encoding='utf-8') as f:
-        raw_header = f.readline().rstrip('\n').split('\t')
-        if col not in raw_header:
+        header = f.readline().rstrip('\n').split('\t')
+        if col not in header:
             return ctr
-        idx = raw_header.index(col)
+        idx = header.index(col)
         for line in f:
             parts = line.rstrip('\n').split('\t')
             if idx < len(parts):
@@ -92,7 +90,6 @@ def scan_and_print_distribution(path: str, col: str) -> Counter:
                 if v != '':
                     ctr[v] += 1
     return ctr
-
 def read_and_map(path: str, task_name: str) -> List[Dict[str,Any]]:
     rows = []
     if not os.path.exists(path):
@@ -104,9 +101,6 @@ def read_and_map(path: str, task_name: str) -> List[Dict[str,Any]]:
         header = []
         seen = {}
         for h in raw_header:
-            h = h.strip()
-            if h == '':
-                h = 'col'
             if h not in seen:
                 header.append(h)
                 seen[h] = 1
@@ -119,11 +113,9 @@ def read_and_map(path: str, task_name: str) -> List[Dict[str,Any]]:
 
         text_col = detect_column(raw_header, ['tweet_text','tweet','text'])
         if text_col is None:
-            text_col = header[2] if len(header) > 2 else header[0]
+            text_col = raw_header[2] if len(raw_header) > 2 else raw_header[0]
 
         image_col = detect_column(raw_header, ['image','image_path','image_id'])
-        if image_col is None:
-            image_col = header[1] if len(header) > 1 else header[0]
 
         if task_name == 'task1':
             label_col = detect_column(raw_header, ['label','damage','label_text_image'])
@@ -140,7 +132,8 @@ def read_and_map(path: str, task_name: str) -> List[Dict[str,Any]]:
             parts = line.rstrip('\n').split('\t')
             if len(parts) < len(header):
                 parts += [''] * (len(header) - len(parts))
-            rec = {c: parts[i] for c,i in col_idx.items()}
+
+            rec = {c: parts[i] for c, i in col_idx.items()}
 
             def fetch(colname):
                 if colname in rec:
@@ -152,7 +145,7 @@ def read_and_map(path: str, task_name: str) -> List[Dict[str,Any]]:
 
             text = safe_str(fetch(text_col))
             img  = safe_str(fetch(image_col))
-            raw = safe_str(fetch(label_col)).lower() if label_col else ""
+            raw = safe_str(fetch(label_col)).lower()
 
             mapped = -1
             if raw:
@@ -168,45 +161,58 @@ def read_and_map(path: str, task_name: str) -> List[Dict[str,Any]]:
                 't2': mapped if task_name == 'task2' else -1,
                 't4': mapped if task_name == 'task3' else -1
             })
+
     return rows
+
 class CrisisDataset(Dataset):
-    def __init__(self, rows, processor: CLIPProcessor, max_text_len=77, image_size=224):
+    def __init__(self, rows, processor, max_text_len=77, target_size=(224,224)):
         self.rows = rows
         self.processor = processor
         self.max_text_len = max_text_len
-        self.image_size = image_size
+        self.target_size = target_size
+
+        self.mean = np.array([0.48145466, 0.4578275, 0.40821073], np.float32)
+        self.std  = np.array([0.26862954, 0.26130258, 0.27577711], np.float32)
 
     def __len__(self):
         return len(self.rows)
 
-    def _load_image(self, path: str) -> Image.Image:
+    def _load_image(self, path):
         try:
             if path and os.path.exists(path):
                 img = Image.open(path).convert("RGB")
             else:
-                raise FileNotFoundError()
-        except Exception:
-            img = Image.new("RGB", (self.image_size, self.image_size))
+                raise Exception()
+        except:
+            img = Image.fromarray(np.zeros((self.target_size[1], self.target_size[0], 3), np.uint8))
         return img
 
-    def __getitem__(self, idx: int):
-        row = self.rows[idx]
-        text = row.get('tweet_text','')
-        img_path = row.get('image_path','')
-        image = self._load_image(img_path)
+    def _process_image(self, img):
+        img = img.resize(self.target_size, Image.BICUBIC)
+        arr = np.array(img).astype("float32") / 255.0
+        arr = (arr - self.mean) / self.std
+        arr = arr.transpose(2,0,1)
+        return torch.tensor(arr, dtype=torch.float32)
 
-        proc_out = self.processor(
-            text=[text],
-            images=[image],
-            padding='max_length',
+    def __getitem__(self, idx):
+        row = self.rows[idx]
+
+        text = row.get('tweet_text','')
+        img = self._load_image(row.get('image_path',''))
+        pixel_values = self._process_image(img)
+
+        tok = self.processor.tokenizer(
+            text,
+            padding="max_length",
             truncation=True,
             max_length=self.max_text_len,
-            return_tensors='pt'
+            return_tensors="pt"
         )
+
         inputs = {
-            'input_ids': proc_out['input_ids'].squeeze(0),
-            'attention_mask': proc_out['attention_mask'].squeeze(0),
-            'pixel_values': proc_out['pixel_values'].squeeze(0)
+            'input_ids': tok['input_ids'].squeeze(0),
+            'attention_mask': tok['attention_mask'].squeeze(0),
+            'pixel_values': pixel_values
         }
 
         labels = {
@@ -214,15 +220,17 @@ class CrisisDataset(Dataset):
             't2': torch.tensor(row.get('t2', -1), dtype=torch.long),
             't4': torch.tensor(row.get('t4', -1), dtype=torch.long)
         }
+
         return inputs, labels
 
 def collate_batch(batch):
     inputs = [x[0] for x in batch]
     labels = [x[1] for x in batch]
+
     return {
         'input_ids': torch.stack([i['input_ids'] for i in inputs]),
         'attention_mask': torch.stack([i['attention_mask'] for i in inputs]),
-        'pixel_values': torch.stack([i['pixel_values'] for i in inputs]),
+        'pixel_values': torch.stack([i['pixel_values'] for i in inputs])
     }, {
         't1': torch.stack([l['t1'] for l in labels]),
         't2': torch.stack([l['t2'] for l in labels]),
@@ -247,25 +255,27 @@ class QueryingTransformer(nn.Module):
     def forward(self, ie, te):
         B = ie.size(0)
         q = self.query_tokens.unsqueeze(0).expand(B,-1,-1)
-        x = torch.cat([q, ie, te], dim=1) 
+        x = torch.cat([q, ie, te], dim=1)
         x = self.tr(x.permute(1,0,2)).permute(1,0,2)
-        pooled = x[:, :self.n_query].mean(1) 
+        pooled = x[:, :self.n_query].mean(1)
         return self.proj(pooled)
 
-class AdapterHead(nn.Module):
-    def __init__(self, in_dim, out_dim, bottleneck=128, dropout=0.2):
+
+class ClassificationHead(nn.Module):
+    def __init__(self, in_dim, out_dim):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, bottleneck),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(bottleneck, out_dim)
+            nn.Linear(in_dim,256),
+            nn.GELU(),
+            nn.Dropout(0.2),
+            nn.Linear(256,out_dim)
         )
     def forward(self, x):
         return self.net(x)
 
+
 class MultimodalMultiTask(nn.Module):
-    def __init__(self, clip_model_name, embed_dim=512, freeze_backbone=True, unfreeze_last_n=0):
+    def __init__(self, clip_model_name, embed_dim=512, freeze_backbone=True):
         super().__init__()
         self.clip = CLIPModel.from_pretrained(clip_model_name)
 
@@ -273,45 +283,13 @@ class MultimodalMultiTask(nn.Module):
             for p in self.clip.parameters():
                 p.requires_grad = False
 
-        if unfreeze_last_n > 0:
-            self._unfreeze_last_n_layers(unfreeze_last_n)
-
         self.img_proj = nn.Linear(self.clip.vision_model.config.hidden_size, embed_dim)
         self.txt_proj = nn.Linear(self.clip.text_model.config.hidden_size, embed_dim)
 
-        self.querying = QueryingTransformer(embed_dim=embed_dim)
-        self.head_t1 = AdapterHead(embed_dim, 3, bottleneck=256)
-        self.head_t2 = AdapterHead(embed_dim, 2, bottleneck=128)
-        self.head_t4 = AdapterHead(embed_dim, 2, bottleneck=128)
-
-    def _unfreeze_last_n_layers(self, n:int):
-        def _unfreeze(module, name_prefix, n):
-            blocks = None
-            for attr in ['encoder.layers','encoder.layer','transformer.layer','layers','encoder.encoder.layer']:
-                try:
-                    obj = module
-                    for part in attr.split('.'):
-                        obj = getattr(obj, part)
-                    if isinstance(obj, (list, tuple)) or hasattr(obj, '__len__'):
-                        blocks = obj
-                        break
-                except Exception:
-                    continue
-            if blocks is None:
-                return
-            L = len(blocks)
-            for i in range(max(0, L-n), L):
-                for p in blocks[i].parameters():
-                    p.requires_grad = True
-
-        try:
-            _unfreeze(self.clip.vision_model, 'vision_model', n)
-        except Exception:
-            pass
-        try:
-            _unfreeze(self.clip.text_model, 'text_model', n)
-        except Exception:
-            pass
+        self.querying = QueryingTransformer(embed_dim)
+        self.head_t1 = ClassificationHead(embed_dim,3)
+        self.head_t2 = ClassificationHead(embed_dim,2)
+        self.head_t4 = ClassificationHead(embed_dim,2)
 
     def forward(self, batch):
         out = self.clip(
@@ -321,12 +299,8 @@ class MultimodalMultiTask(nn.Module):
             output_hidden_states=True,
             return_dict=True
         )
-        try:
-            vp = out.vision_model_output.pooler_output
-            tp = out.text_model_output.pooler_output
-        except Exception:
-            vp = out.vision_model_output.last_hidden_state.mean(1)
-            tp = out.last_hidden_state[:,0,:]
+        vp = out.vision_model_output.pooler_output
+        tp = out.text_model_output.pooler_output
 
         vp = self.img_proj(vp).unsqueeze(1)
         tp = self.txt_proj(tp).unsqueeze(1)
@@ -338,202 +312,90 @@ class MultimodalMultiTask(nn.Module):
             't2_logits': self.head_t2(mm),
             't4_logits': self.head_t4(mm)
         }
-def focal_loss(inputs: torch.Tensor, targets: torch.Tensor, alpha=None, gamma=2.0):
-    """
-    inputs: logits (N, C)
-    targets: (N,) long
-    """
-    logpt = -F.cross_entropy(inputs, targets, reduction='none')
-    pt = torch.exp(logpt)
-    loss = -((1-pt)**gamma) * logpt
-    if alpha is not None:
-        at = alpha.gather(0, targets)
-        loss = loss * at
-    return loss.mean()
 
-def compute_masked_losses(outputs: Dict[str,torch.Tensor],
-                           labels: Dict[str,torch.Tensor],
-                           device: torch.device,
-                           class_weights: Dict[str,Optional[torch.Tensor]],
-                           use_focal: bool=False,
-                           focal_gamma: float=2.0) -> torch.Tensor:
+def compute_masked_losses(outputs, labels, device):
     loss = torch.tensor(0.0, device=device, requires_grad=True)
     for t in ['t1','t2','t4']:
         mask = labels[t] >= 0
         if mask.any():
-            logits = outputs[f'{t}_logits'][mask]
-            targets = labels[t][mask].to(device)
-            weight = class_weights.get(t, None)
-            if use_focal:
-                if weight is not None:
-                    alpha = weight.to(device)
-                else:
-                    alpha = None
-                l = focal_loss(logits, targets, alpha=alpha, gamma=focal_gamma)
-            else:
-                if weight is not None:
-                    l = F.cross_entropy(logits, targets, weight=weight.to(device))
-                else:
-                    l = F.cross_entropy(logits, targets)
+            l = F.cross_entropy(outputs[f'{t}_logits'][mask], labels[t][mask])
             loss = loss + l
     return loss
 
-def compute_metrics_from_preds(preds: Dict[str,torch.Tensor],
-                               labels: Dict[str,torch.Tensor],
-                               gate_by_t1: bool = True) -> Dict[str,float]:
+def compute_metrics(preds, labels):
     out = {}
     for t in ['t1','t2','t4']:
-        pred_logits = preds.get(f'{t}_logits')
-        if pred_logits is None:
-            continue
-        pred = pred_logits.argmax(1)
-        lab = labels[t]
-        mask = lab >= 0
-        if mask.sum().item() == 0:
-            continue
-
-        if gate_by_t1 and t != 't1' and ('t1' in preds):
-            t1_pred = preds['t1_logits'].argmax(1)
-            gate_mask = t1_pred >= 1
-            mask = mask & gate_mask
-
-        if mask.sum().item() == 0:
-            out[f'{t}_acc'] = float('nan')
-            out[f'{t}_prec'] = float('nan')
-            out[f'{t}_rec'] = float('nan')
-            out[f'{t}_f1'] = float('nan')
-            continue
-
-        p = pred[mask].cpu().long()
-        r = lab[mask].cpu().long()
-
-        acc = float((p==r).float().mean().item())
-
-        classes = torch.unique(torch.cat([p, r])).tolist()
-        precisions = []
-        recalls = []
-        f1s = []
-        for c in classes:
-            tp = ((p==c) & (r==c)).sum().item()
-            fp = ((p==c) & (r!=c)).sum().item()
-            fn = ((p!=c) & (r==c)).sum().item()
-            prec = tp / (tp+fp) if (tp+fp)>0 else 0.0
-            rec  = tp / (tp+fn) if (tp+fn)>0 else 0.0
-            f1 = (2*prec*rec)/(prec+rec) if (prec+rec)>0 else 0.0
-            precisions.append(prec)
-            recalls.append(rec)
-            f1s.append(f1)
-        out[f'{t}_acc'] = acc
-        out[f'{t}_prec'] = float(np.mean(precisions))
-        out[f'{t}_rec'] = float(np.mean(recalls))
-        out[f'{t}_f1'] = float(np.mean(f1s))
+        mask = labels[t] >= 0
+        if mask.any():
+            pr = preds[f'{t}_logits'][mask].argmax(1).cpu()
+            tr = labels[t][mask].cpu()
+            out[f'{t}_acc'] = float((pr==tr).float().mean())
     return out
 
-def evaluate(model: nn.Module, loader: DataLoader, device: torch.device,
-             gate_by_t1: bool=True) -> Dict[str,float]:
+def evaluate(model, loader, device):
     model.eval()
-    preds = {f'{t}_logits': [] for t in ['t1','t2','t4']}
-    labs = {t: [] for t in ['t1','t2','t4']}
+    p = {f'{t}_logits': [] for t in ['t1','t2','t4']}
+    l = {t: [] for t in ['t1','t2','t4']}
     with torch.no_grad():
         for inp, lbl in loader:
             inp = {k:v.to(device) for k,v in inp.items()}
             out = model(inp)
             for t in ['t1','t2','t4']:
-                preds[f'{t}_logits'].append(out[f'{t}_logits'].cpu())
-                labs[t].append(lbl[t])
-    preds = {k: torch.cat(v, 0) for k,v in preds.items()}
-    labs  = {k: torch.cat(v, 0) for k,v in labs.items()}
-    return compute_metrics_from_preds(preds, labs, gate_by_t1)
+                p[f'{t}_logits'].append(out[f'{t}_logits'].cpu())
+                l[t].append(lbl[t])
+    preds = {k:torch.cat(v,0) for k,v in p.items()}
+    labs  = {k:torch.cat(v,0) for k,v in l.items()}
+    return compute_metrics(preds,labs)
 
-def train(model: nn.Module, train_loader: DataLoader, dev_loader: DataLoader, cfg: Dict[str,Any]):
-    device = torch.device(cfg['device'])
+
+def train(model, train_loader, dev_loader, cfg):
+    device = cfg['device']
     model.to(device)
 
-    print("Computing class weights from training dataset...")
-    label_counts = defaultdict(Counter)
-    for _, lbl in train_loader.dataset: 
-        for t in ['t1','t2','t4']:
-            v = int(lbl[t].item())
-            if v >= 0:
-                label_counts[t][v] += 1
+    opt = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=cfg['lr'], weight_decay=1e-2
+    )
 
-    class_weights = {}
-    for t in ['t1','t2','t4']:
-        cnt = label_counts[t]
-        if len(cnt) == 0:
-            class_weights[t] = None
-            continue
-        total = sum(cnt.values())
-        freqs = [cnt.get(i,0) for i in range(max(cnt.keys())+1)]
-        inv = [total/(f+1e-12) for f in freqs]
-        inv = np.array(inv, dtype=np.float32)
-        inv = inv / inv.sum() * len(inv)
-        class_weights[t] = torch.tensor(inv, dtype=torch.float32)
-
-        print(f"Task {t} class counts: {dict(cnt)} -> weights: {inv.tolist()}")
-    opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
-                             lr=cfg['lr'], weight_decay=cfg['weight_decay'])
-
-    total_steps = len(train_loader) * cfg['epochs']
-    warmup_steps = max(1, int(total_steps * cfg['warmup_frac']))
-    sched = get_cosine_schedule_with_warmup(opt, num_warmup_steps=warmup_steps, num_training_steps=total_steps)
-
-    scaler = torch.cuda.amp.GradScaler(enabled=(cfg['amp'] and device.type=='cuda'))
+    sched = get_cosine_schedule_with_warmup(
+        opt, 200, len(train_loader)*cfg['epochs']
+    )
 
     os.makedirs(cfg['save_dir'], exist_ok=True)
-    best_scores = {'t2_f1': -1.0, 't1_f1': -1.0}
-    global_step = 0
+    best = -1.0
 
     for ep in range(cfg['epochs']):
         model.train()
-        running_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {ep+1}/{cfg['epochs']}", leave=False)
-        for batch_idx, (inp, lbl) in enumerate(pbar):
+        total = 0.0
+
+        for i,(inp,lbl) in enumerate(tqdm(train_loader, desc=f"Epoch {ep}")):
             inp = {k:v.to(device) for k,v in inp.items()}
             lbl = {k:v.to(device) for k,v in lbl.items()}
 
-            with torch.cuda.amp.autocast(enabled=(cfg['amp'] and device.type=='cuda')):
-                out = model(inp)
-                loss = compute_masked_losses(out, lbl, device, class_weights,
-                                             use_focal=cfg['use_focal'], focal_gamma=cfg['focal_gamma'])
+            out = model(inp)
+            loss = compute_masked_losses(out, lbl, device)
 
             opt.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], cfg['grad_clip'])
-            scaler.step(opt)
-            scaler.update()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
             sched.step()
 
-            running_loss += loss.item()
-            global_step += 1
-            if batch_idx % 20 == 0:
-                pbar.set_postfix({'loss': running_loss/(batch_idx+1)})
-        avg_loss = running_loss / len(train_loader)
-        print(f"Epoch {ep+1} train_loss: {avg_loss:.6f}")
-        metrics = evaluate(model, dev_loader, device, gate_by_t1=cfg['gate_by_t1'])
-        print(f"Dev metrics epoch {ep+1}:", metrics)
-        t2_f1 = metrics.get('t2_f1', float('nan'))
-        t1_f1 = metrics.get('t1_f1', float('nan'))
-        criterion_score = t2_f1 if not np.isnan(t2_f1) else t1_f1
+            total += loss.item()
 
-        if not np.isnan(criterion_score) and criterion_score > best_scores.get('t2_f1', -1.0):
-            best_scores['t2_f1'] = criterion_score
-            ckpt = os.path.join(cfg['save_dir'], f"best_t2_epoch{ep+1}.pt")
-            torch.save({'model_state': model.state_dict(),
-                        'cfg': cfg,
-                        'epoch': ep+1,
-                        'metrics': metrics}, ckpt)
-            print("Saved best_t2 checkpoint:", ckpt)
-        last_ckpt = os.path.join(cfg['save_dir'], f"last_epoch{ep+1}.pt")
-        torch.save({'model_state': model.state_dict(),
-                    'cfg': cfg,
-                    'epoch': ep+1,
-                    'metrics': metrics}, last_ckpt)
+        print(f"Epoch {ep} Loss: {total/len(train_loader):.6f}")
 
-    print("Training finished. Best t2_f1:", best_scores['t2_f1'])
+        m = evaluate(model, dev_loader, device)
+        print("Dev:", m)
 
-def build_dataloaders(data_cfg, clip_model, batch_size, max_text_len, num_workers, pin_memory, image_size):
+        score = m.get('t2_acc', m.get('t1_acc', 0))
+        if score > best:
+            best = score
+            ckpt = os.path.join(cfg['save_dir'], f"best_{ep}.pt")
+            torch.save({'model_state': model.state_dict(), 'cfg': cfg}, ckpt)
+            print("Saved", ckpt)
+
+def build_dataloaders(data_cfg, clip_model, batch_size, max_text_len, num_workers, pin_memory):
     print("=== Scanning label distributions ===")
     for tg, paths in data_cfg.items():
         col = 'label' if tg=='task1' else 'label_text_image'
@@ -548,8 +410,8 @@ def build_dataloaders(data_cfg, clip_model, batch_size, max_text_len, num_worker
 
     processor = CLIPProcessor.from_pretrained(clip_model)
 
-    train_ds = CrisisDataset(train_rows, processor, max_text_len, image_size)
-    dev_ds   = CrisisDataset(dev_rows, processor, max_text_len, image_size)
+    train_ds = CrisisDataset(train_rows, processor, max_text_len, TARGET_IMAGE_SIZE)
+    dev_ds   = CrisisDataset(dev_rows, processor, max_text_len, TARGET_IMAGE_SIZE)
 
     train_loader = DataLoader(
         train_ds, batch_size=batch_size, shuffle=True,
@@ -573,10 +435,6 @@ def main(argv=None):
     parser.add_argument('--save_dir', default=DEFAULTS['save_dir'])
     parser.add_argument('--num_workers', type=int, default=DEFAULTS['num_workers'])
     parser.add_argument('--pin_memory', action='store_true')
-    parser.add_argument('--unfreeze_last_n', type=int, default=DEFAULTS['unfreeze_last_n_clip_layers'])
-    parser.add_argument('--use_focal', action='store_true')
-    parser.add_argument('--focal_gamma', type=float, default=DEFAULTS['focal_gamma'])
-    parser.add_argument('--amp', action='store_true')
     args, _ = parser.parse_known_args(argv)
 
     cfg = {
@@ -586,32 +444,21 @@ def main(argv=None):
         'lr': args.lr,
         'device': args.device,
         'save_dir': args.save_dir,
-        'max_text_len': DEFAULTS['max_text_len'],
-        'num_workers': args.num_workers,
-        'pin_memory': args.pin_memory,
-        'image_size': DEFAULTS['image_size'],
-        'warmup_frac': DEFAULTS['warmup_frac'],
-        'unfreeze_last_n': args.unfreeze_last_n,
-        'use_focal': args.use_focal,
-        'focal_gamma': args.focal_gamma,
-        'weight_decay': DEFAULTS['weight_decay'],
-        'grad_clip': DEFAULTS['grad_clip'],
-        'amp': args.amp,
-        'gate_by_t1': DEFAULTS['gate_by_t1']
+        'max_text_len': DEFAULTS['max_text_len']
     }
 
     print("Device:", cfg['device'])
+
     train_loader, dev_loader = build_dataloaders(
         DATA_CONFIG, cfg['clip_model'], cfg['batch_size'], cfg['max_text_len'],
-        cfg['num_workers'], cfg['pin_memory'], cfg['image_size']
+        args.num_workers, args.pin_memory
     )
+
     print("Train batches:", len(train_loader), "| Dev batches:", len(dev_loader))
 
-    model = MultimodalMultiTask(cfg['clip_model'],
-                                embed_dim=512,
-                                freeze_backbone=True,
-                                unfreeze_last_n=cfg['unfreeze_last_n'])
+    model = MultimodalMultiTask(cfg['clip_model'])
     train(model, train_loader, dev_loader, cfg)
+
 
 if __name__ == "__main__":
     import multiprocessing
