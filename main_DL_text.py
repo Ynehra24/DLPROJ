@@ -42,13 +42,11 @@ DEFAULTS = {
 }
 
 # ----------------- KNOWN LABEL MAPPINGS (from your distributions) -----------------
-# Damage: severe_damage / mild_damage / little_or_no_damage  -> 2/1/0
 DAMAGE_MAP = {
     'little_or_no_damage': 0,
     'mild_damage': 1,
     'severe_damage': 2
 }
-# Humanitarian & Informative: Positive/Negative -> 1/0 (normalize case)
 BINARY_MAP = {
     'negative': 0,
     'positive': 1
@@ -91,10 +89,8 @@ def read_and_map(path: str, task_name: str) -> List[Dict[str,Any]]:
     with open(path, 'r', encoding='utf-8') as f:
         header = f.readline().rstrip('\n').split('\t')
         col_idx = {c:i for i,c in enumerate(header)}
-        # heuristics for columns
         text_col = detect_column(header, ['tweet_text','tweet','text'])
         if text_col is None:
-            # fallback to any likely column
             text_col = header[2] if len(header) > 2 else header[0]
         image_col = detect_column(header, ['image','image_path','image_id'])
         label_col = None
@@ -118,7 +114,6 @@ def read_and_map(path: str, task_name: str) -> List[Dict[str,Any]]:
                         mapped = DAMAGE_MAP.get(raw, -1)
                     else:
                         mapped = BINARY_MAP.get(raw, -1)
-            # set standardized fields
             rec['tweet_text'] = text
             rec['image_path'] = img
             rec['t1'] = mapped if task_name == 'task1' else -1
@@ -132,7 +127,8 @@ class CrisisDataset(Dataset):
     def __init__(self, rows: List[Dict[str,Any]], processor: CLIPProcessor, max_text_len:int=77):
         self.rows = rows
         self.processor = processor
-        self.max_text_len = max_text_len
+        # enforce CLIP text limit (usually 77)
+        self.max_text_len = min(max_text_len, DEFAULTS['max_text_len'])
     def __len__(self): return len(self.rows)
     def _load_image(self, path: str):
         if not path:
@@ -151,14 +147,25 @@ class CrisisDataset(Dataset):
         img = self._load_image(img_path)
         if img is None:
             img = Image.new('RGB', (224,224), (0,0,0))
-        inputs = self.processor(
-            text=[text],
-            images=img,
-            return_tensors='pt',
-            padding='max_length',
-            truncation=True,
-            max_length=self.max_text_len
-        )
+        # try with safe parameters; if processor complains about padding, retry with padding=True
+        try:
+            inputs = self.processor(
+                text=[text],
+                images=img,
+                return_tensors='pt',
+                padding='max_length',
+                truncation=True,
+                max_length=self.max_text_len
+            )
+        except ValueError:
+            inputs = self.processor(
+                text=[text],
+                images=img,
+                return_tensors='pt',
+                padding=True,
+                truncation=True,
+                max_length=self.max_text_len
+            )
         inputs = {k: v.squeeze(0) for k,v in inputs.items()}
         labels = {
             't1': torch.tensor(r.get('t1', -1), dtype=torch.long),
@@ -170,9 +177,16 @@ class CrisisDataset(Dataset):
 def collate_batch(batch):
     inputs_list = [b[0] for b in batch]
     labels_list = [b[1] for b in batch]
+    # gather keys safely
     input_ids = torch.stack([i['input_ids'] for i in inputs_list])
     attention_mask = torch.stack([i['attention_mask'] for i in inputs_list])
-    pixel_values = torch.stack([i['pixel_values'] for i in inputs_list])
+    # pixel_values might be present and should be B x C x H x W
+    if 'pixel_values' in inputs_list[0]:
+        pixel_values = torch.stack([i['pixel_values'] for i in inputs_list])
+    else:
+        # fallback zero tensor
+        bs = len(inputs_list)
+        pixel_values = torch.zeros((bs, 3, 224, 224), dtype=torch.float)
     collated = {'input_ids': input_ids, 'attention_mask': attention_mask, 'pixel_values': pixel_values}
     labels = {k: torch.stack([l[k] for l in labels_list]) for k in labels_list[0].keys()}
     return collated, labels
@@ -226,11 +240,11 @@ class MultimodalMultiTask(nn.Module):
         )
         try:
             img_pool = clip_out.vision_model_output.pooler_output
-        except:
+        except Exception:
             img_pool = clip_out.vision_model_output.last_hidden_state.mean(dim=1)
         try:
             txt_pool = clip_out.text_model_output.pooler_output
-        except:
+        except Exception:
             txt_pool = clip_out.text_model_output.last_hidden_state.mean(dim=1)
         img_tok = self.img_proj(img_pool).unsqueeze(1)
         txt_tok = self.txt_proj(txt_pool).unsqueeze(1)
@@ -248,15 +262,15 @@ def compute_masked_losses(outputs, labels, device):
     losses = {}
     m1 = labels['t1'] >= 0
     if m1.any():
-        l1 = F.cross_entropy(outputs['t1_logits'][m1], labels['t1'][m1].to(device))
+        l1 = F.cross_entropy(outputs['t1_logits'][m1].to(device), labels['t1'][m1].to(device))
         losses['t1'] = float(l1.detach().cpu()); loss = loss + l1
     m2 = labels['t2'] >= 0
     if m2.any():
-        l2 = F.cross_entropy(outputs['t2_logits'][m2], labels['t2'][m2].to(device))
+        l2 = F.cross_entropy(outputs['t2_logits'][m2].to(device), labels['t2'][m2].to(device))
         losses['t2'] = float(l2.detach().cpu()); loss = loss + l2
     m4 = labels['t4'] >= 0
     if m4.any():
-        l4 = F.cross_entropy(outputs['t4_logits'][m4], labels['t4'][m4].to(device))
+        l4 = F.cross_entropy(outputs['t4_logits'][m4].to(device), labels['t4'][m4].to(device))
         losses['t4'] = float(l4.detach().cpu()); loss = loss + l4
     return loss, losses
 
@@ -329,12 +343,10 @@ def train(model: nn.Module, train_loader: DataLoader, dev_loader: DataLoader, cf
 
 # ----------------- Build dataloaders (uses fixed mappings above) -----------------
 def build_dataloaders(data_cfg, clip_model_name, batch_size, max_text_len=77):
-    # Print distributions (optional quick sanity)
     print("=== Scanning label distributions (first few lines) ===")
     for tg, paths in data_cfg.items():
         train_p = paths['train_tsv']
         dev_p = paths['dev_tsv']
-        # choose column to scan
         col = 'label' if tg == 'task1' else 'label_text_image'
         ctr_train = scan_and_print_distribution(train_p, col)
         ctr_dev = scan_and_print_distribution(dev_p, col)
@@ -342,13 +354,11 @@ def build_dataloaders(data_cfg, clip_model_name, batch_size, max_text_len=77):
             print(f"{tg} train {col} distribution (top 10): {ctr_train.most_common(10)}")
         if ctr_dev:
             print(f"{tg} dev {col} distribution (top 10): {ctr_dev.most_common(10)}")
-    # Read & map rows
     train_rows = []
     dev_rows = []
     for tg, paths in data_cfg.items():
         train_rows += read_and_map(paths['train_tsv'], tg)
         dev_rows += read_and_map(paths['dev_tsv'], tg)
-    # Report labeled counts
     def count_lab(rows):
         c = {'t1':0,'t2':0,'t4':0}
         for r in rows:
@@ -358,8 +368,11 @@ def build_dataloaders(data_cfg, clip_model_name, batch_size, max_text_len=77):
         return c
     print("Train labeled counts:", count_lab(train_rows))
     print("Dev labeled counts:", count_lab(dev_rows))
-    # processor + datasets
-    processor = CLIPProcessor.from_pretrained(clip_model_name)
+    # create processor with fallback
+    try:
+        processor = CLIPProcessor.from_pretrained(clip_model_name)
+    except Exception:
+        processor = CLIPProcessor.from_pretrained(clip_model_name, local_files_only=False)
     train_ds = CrisisDataset(train_rows, processor, max_text_len)
     dev_ds = CrisisDataset(dev_rows, processor, max_text_len)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_batch)
@@ -387,7 +400,6 @@ def main(argv=None):
     }
     train_loader, dev_loader = build_dataloaders(DATA_CONFIG, cfg['clip_model'], cfg['batch_size'], cfg['max_text_len'])
     print(f"Train batches: {len(train_loader)}, Dev batches: {len(dev_loader)}")
-    # set class counts explicitly from mapping knowledge
     model = MultimodalMultiTask(clip_model_name=cfg['clip_model'], embed_dim=512, freeze_backbone=True, t1_classes=3, t2_classes=2, t4_classes=2)
     train(model, train_loader, dev_loader, cfg)
 
