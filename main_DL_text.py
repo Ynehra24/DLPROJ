@@ -1,21 +1,14 @@
-#!/usr/bin/env python3
 import os
 import sys
 import argparse
-import random
-from pathlib import Path
 from collections import Counter
 from typing import List, Dict, Any, Optional
 
 import numpy as np
 from PIL import Image
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from tqdm.auto import tqdm
-from transformers import CLIPProcessor, CLIPModel, get_cosine_schedule_with_warmup
-from sklearn.metrics import classification_report, confusion_matrix
+from transformers import CLIPProcessor
 
 # ----------------------------
 # CONFIG - edit these paths if needed
@@ -35,17 +28,14 @@ DATA_CONFIG = {
     }
 }
 
-# local uploaded paper path (developer note / provenance)
-PAPER_PATH = "/mnt/data/emnlp.pdf"
-
 DEFAULTS = {
     'clip_model': 'openai/clip-vit-base-patch32',
     'batch_size': 16,
     'epochs': 8,
     'lr': 3e-4,
-    'backbone_lr': 5e-6,
-    'device': 'cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'),
-    'save_dir': 'checkpoints_hier_final',
+    'backbone_lr': 1e-5,
+    'device': 'mps',
+    'save_dir': 'checkpoints_sota',
     'max_text_len': 77,
     'num_workers': 0,
     'pin_memory': False,
@@ -53,7 +43,6 @@ DEFAULTS = {
     'embed_dim': 512,
 }
 
-# mappings
 DAMAGE_MAP = {'little_or_no_damage':0,'mild_damage':1,'severe_damage':2}
 HUM_LABEL_TO_TASK2 = {
     'not_humanitarian':0,'other_relevant_information':0,
@@ -67,9 +56,6 @@ HUM_LABEL_TO_T4 = {
     'infrastructure_and_utility_damage':2,'vehicle_damage':2
 }
 
-# ----------------------------
-# TSV reading + row builder
-# ----------------------------
 def safe_str(x):
     if x is None: return ''
     if isinstance(x, str): return x.strip()
@@ -138,26 +124,33 @@ def build_combined_rows(data_cfg: Dict[str,Any]):
                 else: dev_rows.append(row)
     return train_rows, dev_rows
 
-# ----------------------------
-# Dataset class (CLIPProcessor handles both text+image)
-# ----------------------------
+from torchvision import transforms
+
 class CrisisDataset(Dataset):
-    def __init__(self, rows: List[Dict[str,Any]], processor: CLIPProcessor, max_text_len=77, image_size=224):
+    def __init__(self, rows: List[Dict[str,Any]], processor: CLIPProcessor, max_text_len=77, image_size=224, augment=False):
         self.rows = rows
         self.proc = processor
         self.max_text_len = max_text_len
         self.image_size = image_size
+        self.augment = augment
+        self.aug = transforms.Compose([
+            transforms.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
+        ]) if augment else None
 
     def __len__(self): return len(self.rows)
 
     def _load_image(self, path):
         try:
             if path and os.path.exists(path):
-                img=Image.open(path).convert('RGB')
+                img = Image.open(path).convert('RGB')
+                if self.augment and self.aug:
+                    img = self.aug(img)
             else:
                 raise FileNotFoundError()
         except Exception:
-            img=Image.new('RGB', (self.image_size,self.image_size), (0,0,0))
+            img = Image.new('RGB', (self.image_size, self.image_size), (0,0,0))
         return img
 
     def __getitem__(self, idx):
@@ -187,32 +180,54 @@ def collate_batch(batch):
                     't4': torch.stack([l['t4'] for l in labels])}
     return batched_inputs, batched_labels
 
+def scan_and_print_distribution(path: str, col: str):
+    ctr = Counter()
+    if not path or not os.path.exists(path): return ctr
+    with open(path, 'r', encoding='utf-8') as f:
+        header = f.readline().rstrip('\n').split('\t')
+        if col not in header: return ctr
+        idx = header.index(col)
+        for line in f:
+            parts=line.rstrip('\n').split('\t')
+            if idx < len(parts):
+                v=safe_str(parts[idx]).lower()
+                if v: ctr[v]+=1
+    return ctr
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from transformers import CLIPModel, CLIPProcessor, get_cosine_schedule_with_warmup
+from tqdm.auto import tqdm
+from sklearn.metrics import classification_report, confusion_matrix
+
 # ----------------------------
-# Model (CLIP backbone with lazy projections + heads)
+# Model (CLIP backbone with trainable heads)
 # ----------------------------
 class MLPHead(nn.Module):
     def __init__(self, in_dim, hidden=256, out_dim=2, dropout=0.2):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(in_dim, hidden), nn.GELU(), nn.Dropout(dropout), nn.Linear(hidden, out_dim))
-    def forward(self,x): return self.net(x)
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, out_dim)
+        )
+    def forward(self, x): return self.net(x)
 
 class HierarchicalMultimodalModel(nn.Module):
-    def __init__(self, clip_model_name, embed_dim=512, freeze_backbone=True):
+    def __init__(self, clip_model_name, embed_dim=512, freeze_backbone=False):
         super().__init__()
         self.clip = CLIPModel.from_pretrained(clip_model_name)
-        # freeze entire CLIP backbone if requested (vision+text)
         if freeze_backbone:
-            for p in self.clip.parameters(): p.requires_grad=False
+            for p in self.clip.parameters(): p.requires_grad = False
 
         self.embed_dim = embed_dim
-        # lazy modules (will be created on first forward)
         self._img_proj = None
         self._txt_proj = None
         self.head_t1 = None; self.head_t2=None; self.head_t3_type=None; self.head_t3_sev=None; self.head_t4=None
 
     def _lazy_init(self, img_repr, txt_repr):
         d_img = img_repr.size(-1); d_txt = txt_repr.size(-1)
-        # create linear projections + heads on device, with trainable params
         if self._img_proj is None:
             self._img_proj = nn.Linear(d_img, self.embed_dim).to(img_repr.device)
         if self._txt_proj is None:
@@ -225,37 +240,29 @@ class HierarchicalMultimodalModel(nn.Module):
             self.head_t4 = MLPHead(self.embed_dim, out_dim=3).to(img_repr.device)
 
     def forward(self, batch):
-        # CLIP forward: we ask for image_embeds and text_embeds (pooled)
-        out = self.clip(input_ids=batch['input_ids'], attention_mask=batch['attention_mask'], pixel_values=batch['pixel_values'], return_dict=True)
-        # prefer official fields
-        if hasattr(out, 'image_embeds') and hasattr(out, 'text_embeds'):
-            img_repr = out.image_embeds
-            txt_repr = out.text_embeds
-        else:
-            # fallbacks
-            if hasattr(out, 'vision_model_output') and hasattr(out.vision_model_output, 'last_hidden_state'):
-                img_repr = out.vision_model_output.last_hidden_state.mean(1)
-            else:
-                img_repr = out.last_hidden_state.mean(1)
-            if hasattr(out, 'text_model_output') and hasattr(out.text_model_output, 'last_hidden_state'):
-                txt_repr = out.text_model_output.last_hidden_state.mean(1)
-            else:
-                txt_repr = out.last_hidden_state[:,0,:]
-
-        # lazy init trainable heads/projections (ensures correct dims)
+        out = self.clip(
+            input_ids=batch['input_ids'],
+            attention_mask=batch['attention_mask'],
+            pixel_values=batch['pixel_values'],
+            return_dict=True
+        )
+        img_repr = out.image_embeds if hasattr(out, 'image_embeds') else out.vision_model_output.last_hidden_state.mean(1)
+        txt_repr = out.text_embeds if hasattr(out, 'text_embeds') else out.text_model_output.last_hidden_state.mean(1)
         if self._img_proj is None or self._txt_proj is None:
             self._lazy_init(img_repr, txt_repr)
-
         vp = self._img_proj(img_repr)
         tp = self._txt_proj(txt_repr)
         mm = (vp + tp) * 0.5  # simple fusion
-
-        return {'t1_logits': self.head_t1(mm), 't2_logits': self.head_t2(mm),
-                't3_type_logits': self.head_t3_type(mm), 't3_sev_logits': self.head_t3_sev(mm),
-                't4_logits': self.head_t4(mm)}
+        return {
+            't1_logits': self.head_t1(mm),
+            't2_logits': self.head_t2(mm),
+            't3_type_logits': self.head_t3_type(mm),
+            't3_sev_logits': self.head_t3_sev(mm),
+            't4_logits': self.head_t4(mm)
+        }
 
 # ----------------------------
-# Loss helpers, evaluate
+# Loss helpers, evaluation
 # ----------------------------
 def focal_loss_logits(inputs, targets, alpha=None, gamma=2.0, reduction='mean'):
     ce = F.cross_entropy(inputs, targets, weight=alpha, reduction='none')
@@ -263,7 +270,8 @@ def focal_loss_logits(inputs, targets, alpha=None, gamma=2.0, reduction='mean'):
     loss = ((1 - pt) ** gamma) * ce
     return loss.mean() if reduction=='mean' else loss.sum()
 
-def compute_class_weights_from_rows(rows: List[Dict[str,Any]], key: str, n_classes: int):
+def compute_class_weights_from_rows(rows, key, n_classes):
+    from collections import Counter
     ctr = Counter([r[key] for r in rows if r.get(key,-1) >= 0])
     if len(ctr)==0: return None
     freqs = np.array([ctr.get(i,0) for i in range(n_classes)], dtype=np.float32)
@@ -271,49 +279,26 @@ def compute_class_weights_from_rows(rows: List[Dict[str,Any]], key: str, n_class
     w = inv / (inv.sum()+1e-12) * len(inv)
     return torch.tensor(w, dtype=torch.float32)
 
-def compute_masked_losses(outputs, labels, device, weights=None, focal_on_t1=True):
+def compute_masked_losses(outputs, labels, device, weights=None):
     loss = torch.tensor(0.0, device=device, requires_grad=True)
     per_task={}
-    # t1
-    mask = labels['t1'] >= 0
-    if mask.any():
-        logits = outputs['t1_logits'][mask]; tg = labels['t1'][mask].to(device)
-        w = weights.get('t1') if (weights and 't1' in weights) else None
-        l = focal_loss_logits(logits, tg, alpha=(w.to(device) if w is not None else None)) if focal_on_t1 else F.cross_entropy(logits, tg, weight=(w.to(device) if w is not None else None))
-        loss = loss + l; per_task['t1']=l
-    else: per_task['t1']=torch.tensor(0.0, device=device)
-    # t2
-    mask = labels['t2'] >= 0
-    if mask.any():
-        logits = outputs['t2_logits'][mask]; tg = labels['t2'][mask].to(device)
-        w = weights.get('t2') if (weights and 't2' in weights) else None
-        l = F.cross_entropy(logits, tg, weight=(w.to(device) if w is not None else None))
-        loss = loss + l; per_task['t2']=l
-    else: per_task['t2']=torch.tensor(0.0, device=device)
-    # t3_type
-    mask = labels['t3_type'] >= 0
-    if mask.any():
-        logits = outputs['t3_type_logits'][mask]; tg = labels['t3_type'][mask].to(device)
-        w = weights.get('t3_type') if (weights and 't3_type' in weights) else None
-        l = F.cross_entropy(logits, tg, weight=(w.to(device) if w is not None else None))
-        loss = loss + l; per_task['t3_type']=l
-    else: per_task['t3_type']=torch.tensor(0.0, device=device)
-    # t3_sev
-    mask = labels['t3_sev'] >= 0
-    if mask.any():
-        logits = outputs['t3_sev_logits'][mask]; tg = labels['t3_sev'][mask].to(device)
-        w = weights.get('t3_sev') if (weights and 't3_sev' in weights) else None
-        l = F.cross_entropy(logits, tg, weight=(w.to(device) if w is not None else None))
-        loss = loss + l; per_task['t3_sev']=l
-    else: per_task['t3_sev']=torch.tensor(0.0, device=device)
-    # t4
-    mask = labels['t4'] >= 0
-    if mask.any():
-        logits = outputs['t4_logits'][mask]; tg = labels['t4'][mask].to(device)
-        w = weights.get('t4') if (weights and 't4' in weights) else None
-        l = F.cross_entropy(logits, tg, weight=(w.to(device) if w is not None else None))
-        loss = loss + l; per_task['t4']=l
-    else: per_task['t4']=torch.tensor(0.0, device=device)
+    for task, out_key, ncls in [
+        ('t1', 't1_logits', 2),
+        ('t2', 't2_logits', 3),
+        ('t3_type', 't3_type_logits', 3),
+        ('t3_sev', 't3_sev_logits', 3),
+        ('t4', 't4_logits', 3)
+    ]:
+        mask = labels[task] >= 0
+        if mask.any():
+            logits = outputs[out_key][mask]
+            tg = labels[task][mask].to(device)
+            w = weights.get(task) if (weights and task in weights) else None
+            l = focal_loss_logits(logits, tg, alpha=(w.to(device) if w is not None else None))
+            loss = loss + l
+            per_task[task] = l
+        else:
+            per_task[task] = torch.tensor(0.0, device=device)
     return loss, per_task
 
 def evaluate_detailed(model, loader, device):
@@ -341,67 +326,21 @@ def evaluate_detailed(model, loader, device):
     return reports, cms
 
 # ----------------------------
-# DATALOADER builder
-# ----------------------------
-def build_dataloaders(data_cfg, clip_model_name, batch_size, max_text_len, num_workers, pin_memory, use_sampler=False):
-    print("=== Scanning data distributions (train TSVs) ===")
-    for k,p in data_cfg.items():
-        ctr = scan_and_print_distribution(p.get('train_tsv',''), 'label')
-        print(k, ctr)
-    train_rows, dev_rows = build_combined_rows(data_cfg)
-    print(f"Train rows: {len(train_rows)}, Dev rows: {len(dev_rows)}")
-    if len(train_rows)==0:
-        print("ERROR: no training rows found. Check DATA_CONFIG paths. Exiting."); sys.exit(1)
-    processor = CLIPProcessor.from_pretrained(clip_model_name)
-    train_ds = CrisisDataset(train_rows, processor, max_text_len, DEFAULTS['image_size'])
-    dev_ds = CrisisDataset(dev_rows, processor, max_text_len, DEFAULTS['image_size'])
-    train_sampler=None
-    if use_sampler:
-        ctr = Counter([r['t3_sev'] for r in train_rows if r.get('t3_sev',-1) >=0])
-        if sum(ctr.values())==0:
-            ctr = Counter([r['t1'] for r in train_rows if r.get('t1',-1) >=0])
-        if sum(ctr.values())>0:
-            total=sum(ctr.values()); class_weight={c: total/(v+1e-12) for c,v in ctr.items()}
-            weights = [float(class_weight.get(r.get('t3_sev', r.get('t1', -1)), 1.0)) for r in train_rows]
-            if len(weights)>0:
-                train_sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
-                print("Using WeightedRandomSampler.")
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=(train_sampler is None), collate_fn=collate_batch, num_workers=num_workers, pin_memory=pin_memory, sampler=train_sampler)
-    dev_loader = DataLoader(dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_batch, num_workers=0, pin_memory=pin_memory)
-    return train_loader, dev_loader, train_rows
-
-def scan_and_print_distribution(path: str, col: str):
-    ctr = Counter()
-    if not path or not os.path.exists(path): return ctr
-    with open(path, 'r', encoding='utf-8') as f:
-        header = f.readline().rstrip('\n').split('\t')
-        if col not in header: return ctr
-        idx = header.index(col)
-        for line in f:
-            parts=line.rstrip('\n').split('\t')
-            if idx < len(parts):
-                v=safe_str(parts[idx]).lower()
-                if v: ctr[v]+=1
-    return ctr
-
-# ----------------------------
-# TRAIN loop
+# Training loop
 # ----------------------------
 def train(model, train_loader, dev_loader, cfg, train_rows):
     device = torch.device(cfg['device']); model.to(device)
-    use_amp = (device.type=='cuda') and cfg.get('use_amp', False)
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
-
-    weights={}
-    weights['t1']=compute_class_weights_from_rows(train_rows,'t1',2)
-    weights['t2']=compute_class_weights_from_rows(train_rows,'t2',3)
-    weights['t3_type']=compute_class_weights_from_rows(train_rows,'t3_type',3)
-    weights['t3_sev']=compute_class_weights_from_rows(train_rows,'t3_sev',3)
-    weights['t4']=compute_class_weights_from_rows(train_rows,'t4',3)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type=='cuda'))
+    weights = {
+        't1': compute_class_weights_from_rows(train_rows,'t1',2),
+        't2': compute_class_weights_from_rows(train_rows,'t2',3),
+        't3_type': compute_class_weights_from_rows(train_rows,'t3_type',3),
+        't3_sev': compute_class_weights_from_rows(train_rows,'t3_sev',3),
+        't4': compute_class_weights_from_rows(train_rows,'t4',3)
+    }
     print("Computed class weights:")
     for k,v in weights.items(): print(k, None if v is None else v.tolist())
 
-    # param groups: use id() to compare parameters robustly
     backbone = [p for n,p in model.named_parameters() if 'clip' in n and p.requires_grad]
     backbone_ids = set(id(p) for p in backbone)
     others = [p for n,p in model.named_parameters() if p.requires_grad and id(p) not in backbone_ids]
@@ -425,9 +364,9 @@ def train(model, train_loader, dev_loader, cfg, train_rows):
         for step, (inp, lbl) in pbar:
             inp = {k:v.to(device) for k,v in inp.items()}; lbl = {k:v.to(device) for k,v in lbl.items()}
             optimizer.zero_grad()
-            with torch.cuda.amp.autocast(enabled=use_amp):
+            with torch.cuda.amp.autocast(enabled=(device.type=='cuda')):
                 outputs = model(inp)
-                loss, _ = compute_masked_losses(outputs, lbl, device, weights=weights, focal_on_t1=True)
+                loss, _ = compute_masked_losses(outputs, lbl, device, weights=weights)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -449,13 +388,36 @@ def train(model, train_loader, dev_loader, cfg, train_rows):
             torch.save({'model_state': model.state_dict(), 'cfg': cfg, 'epoch': epoch+1, 'val_score': val_score}, ckpt)
             print("Saved best checkpoint:", ckpt)
     print("Training finished. Best val score:", best_val)
+def build_dataloaders(data_cfg, clip_model_name, batch_size, max_text_len, num_workers, pin_memory, use_sampler=False):
+    from transformers import CLIPProcessor
+    print("=== Scanning data distributions (train TSVs) ===")
+    for k,p in data_cfg.items():
+        ctr = scan_and_print_distribution(p.get('train_tsv',''), 'label')
+        print(k, ctr)
+    train_rows, dev_rows = build_combined_rows(data_cfg)
+    print(f"Train rows: {len(train_rows)}, Dev rows: {len(dev_rows)}")
+    if len(train_rows)==0:
+        print("ERROR: no training rows found. Check DATA_CONFIG paths. Exiting."); sys.exit(1)
+    processor = CLIPProcessor.from_pretrained(clip_model_name)
+    train_ds = CrisisDataset(train_rows, processor, max_text_len, DEFAULTS['image_size'], augment=True)
+    dev_ds = CrisisDataset(dev_rows, processor, max_text_len, DEFAULTS['image_size'], augment=False)
+    train_sampler=None
+    if use_sampler:
+        ctr = Counter([r['t3_sev'] for r in train_rows if r.get('t3_sev',-1) >=0])
+        if sum(ctr.values())==0:
+            ctr = Counter([r['t1'] for r in train_rows if r.get('t1',-1) >=0])
+        if sum(ctr.values())>0:
+            total=sum(ctr.values()); class_weight={c: total/(v+1e-12) for c,v in ctr.items()}
+            weights = [float(class_weight.get(r.get('t3_sev', r.get('t1', -1)), 1.0)) for r in train_rows]
+            if len(weights)>0:
+                train_sampler = WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+                print("Using WeightedRandomSampler.")
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=(train_sampler is None), collate_fn=collate_batch, num_workers=num_workers, pin_memory=pin_memory, sampler=train_sampler)
+    dev_loader = DataLoader(dev_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_batch, num_workers=0, pin_memory=pin_memory)
+    return train_loader, dev_loader, train_rows
 
-# ----------------------------
-# CLI / main
-# ----------------------------
 def main(argv=None):
-    # avoid ipykernel argv noise when running in notebook
-    if argv is None and 'ipykernel' in sys.modules: argv=[]
+    import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--clip_model', default=DEFAULTS['clip_model'])
     parser.add_argument('--batch_size', type=int, default=DEFAULTS['batch_size'])
@@ -467,46 +429,51 @@ def main(argv=None):
     parser.add_argument('--num_workers', type=int, default=DEFAULTS['num_workers'])
     parser.add_argument('--pin_memory', action='store_true')
     parser.add_argument('--use_sampler', action='store_true')
-    parser.add_argument('--use_amp', action='store_true')
     args = parser.parse_args(argv)
 
-    cfg = {'clip_model': args.clip_model, 'batch_size': args.batch_size, 'epochs': args.epochs, 'lr': args.lr, 'backbone_lr': args.backbone_lr, 'device': args.device, 'save_dir': args.save_dir, 'max_text_len': DEFAULTS['max_text_len'], 'num_workers': args.num_workers, 'pin_memory': args.pin_memory, 'use_amp': args.use_amp}
-    print("Device:", cfg['device']); print("Paper path:", PAPER_PATH)
+    cfg = {
+        'clip_model': args.clip_model,
+        'batch_size': args.batch_size,
+        'epochs': args.epochs,
+        'lr': args.lr,
+        'backbone_lr': args.backbone_lr,
+        'device': args.device,
+        'save_dir': args.save_dir,
+        'max_text_len': DEFAULTS['max_text_len'],
+        'num_workers': args.num_workers,
+        'pin_memory': args.pin_memory
+    }
+    print("Device:", cfg['device'])
 
     # build dataloaders
-    train_loader, dev_loader, train_rows = build_dataloaders(DATA_CONFIG, cfg['clip_model'], cfg['batch_size'], cfg['max_text_len'], cfg['num_workers'], cfg['pin_memory'], use_sampler=args.use_sampler)
+    train_loader, dev_loader, train_rows = build_dataloaders(
+        DATA_CONFIG, cfg['clip_model'], cfg['batch_size'], cfg['max_text_len'],
+        cfg['num_workers'], cfg['pin_memory'], use_sampler=args.use_sampler
+    )
     print("Train batches:", len(train_loader), "| Dev batches:", len(dev_loader))
 
     # create model
-    model = HierarchicalMultimodalModel(cfg['clip_model'], embed_dim=DEFAULTS['embed_dim'], freeze_backbone=True)
+    model = HierarchicalMultimodalModel(cfg['clip_model'], embed_dim=DEFAULTS['embed_dim'], freeze_backbone=False)
 
-    # ----------------------------
-    # IMPORTANT FIX:
-    # If model uses lazy init for heads (created on first forward),
-    # perform a single forward with one batch to ensure trainable params exist
-    # before optimizer creation. This prevents "No trainable params found".
-    # ----------------------------
+    # Lazy init heads
     try:
-        # grab a single batch from train_loader and run a no_grad forward to initialize lazy modules
         sample_iter = iter(train_loader)
-        sample_batch = next(sample_iter)  # (inputs, labels)
+        sample_batch = next(sample_iter)
         sample_inputs, _ = sample_batch
         device = torch.device(cfg['device'])
         model.to(device)
         with torch.no_grad():
-            # move sample to device
             sample_inputs = {k: v.to(device) for k, v in sample_inputs.items()}
-            # if model.clip is on CPU and device is MPS/CUDA, ensure processor tensors are moved
             _ = model(sample_inputs)
-        # done: lazy modules initialized
-    except StopIteration:
-        # no samples (should have been caught earlier), but ignore
-        pass
     except Exception as e:
         print("Warning: initialization forward pass failed (this is non-fatal). Error:", repr(e))
 
-    # enter training loop
+    # train
     train(model, train_loader, dev_loader, cfg, train_rows)
 
 if __name__ == '__main__':
-    main()
+    import sys
+    if 'ipykernel' in sys.modules:
+        main(argv=[])
+    else:
+        main()
