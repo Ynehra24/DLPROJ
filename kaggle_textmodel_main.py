@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""
-FULL MULTIMODAL TRAINING SCRIPT — IMPROVED + EVAL
-Roberta + Swin on ITSACRISIS + CRISISIMAGES
-
-- Multi-task (t1, t2, t3t, t3s, t4)
-- Class weights with mild 1/sqrt(freq) scaling
-- Cross-entropy loss (no focal)
-- Mixed precision (GPU)
-- Cosine LR schedule with warmup
-- Dev evaluation every epoch (accuracy + F1 for all tasks)
-- Saves:
-    /kaggle/working/checkpoints_sota/E{epoch}.pt
-    /kaggle/working/checkpoints_sota/best.pt   (by T2 macro F1)
-"""
-
 # ========================== ENV FIX ==========================
 import os
 os.system("pip install --upgrade protobuf==3.20.3 transformers accelerate sentencepiece safetensors --quiet")
@@ -27,7 +11,7 @@ from collections import Counter
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torchvision import transforms
 
 from PIL import Image
@@ -86,7 +70,11 @@ T2MAP = {
     'infrastructure_and_utility_damage':2, 'vehicle_damage':2
 }
 
-T3TYPE = {'infrastructure_and_utility_damage':0, 'vehicle_damage':1}
+# T3T IS *BINARY* (0=infrastructure, 1=vehicle)
+T3TYPE = {
+    'infrastructure_and_utility_damage':0,
+    'vehicle_damage':1
+}
 
 T4MAP = {
     'affected_individuals':0, 'injured_or_dead_people':0, 'missing_or_found_people':0,
@@ -120,11 +108,11 @@ def load_all():
 
             for r in rows:
                 d = {hdr[i]: r[i] if i < len(r) else "" for i in range(len(hdr))}
-                img = d[IMG].replace(".jpg", "")
+                img_id = d[IMG].replace(".jpg", "")
 
                 item = {
                     "tweet": d[TXT],
-                    "img": IMAGE_INDEX.get(img, None),
+                    "img": IMAGE_INDEX.get(img_id, None),
                     "t1": -1,
                     "t2": -1,
                     "t3t": -1,
@@ -166,13 +154,37 @@ def compute_class_stats(train_rows):
     return stats
 
 def make_weights(counter, num_classes):
-    # milder weighting: 1 / sqrt(freq)
+    # milder weighting: 1 / sqrt(freq + 1)
     import math
     freqs = torch.tensor([counter.get(i, 0) for i in range(num_classes)], dtype=torch.float32)
-    freqs = freqs + 1.0  # avoid zero & too huge weights
+    freqs = freqs + 1.0
     inv = 1.0 / torch.sqrt(freqs)
     inv = inv / inv.mean()
     return inv
+
+# ---- per-sample weights for WeightedRandomSampler ----
+def build_sample_weights(train_rows, stats, max_mult=10.0):
+    """
+    Each sample gets a weight boosted if it has rare labels in any task.
+    Using ~sqrt(majority_freq / freq) per task, multiplicatively.
+    """
+    weights = []
+    for r in train_rows:
+        w = 1.0
+        for task in ["t1","t2","t3t","t3s","t4"]:
+            lbl = r[task]
+            if lbl < 0 or len(stats[task]) == 0:
+                continue
+            freq = stats[task][lbl]
+            maj_freq = max(stats[task].values())
+            # sqrt imbalance factor
+            if freq > 0:
+                factor = (maj_freq / float(freq)) ** 0.5
+                w *= factor
+        # clip insanely large weights
+        w = min(w, max_mult)
+        weights.append(w)
+    return torch.tensor(weights, dtype=torch.float32)
 
 # ======================= DATASET ================================
 
@@ -270,11 +282,11 @@ class MODEL(nn.Module):
         self.tp = nn.Linear(self.txt.config.hidden_size, 512)
         self.vp = nn.Linear(self.vis.config.hidden_size, 512)
         self.f = FUSE(512)
-        self.h1 = HEAD(512, 2)
-        self.h2 = HEAD(512, 3)
-        self.h3t = HEAD(512, 3)
-        self.h3s = HEAD(512, 3)
-        self.h4 = HEAD(512, 3)
+        self.h1 = HEAD(512, 2)  # T1
+        self.h2 = HEAD(512, 3)  # T2
+        self.h3t = HEAD(512, 2) # T3T (binary)  << FIXED
+        self.h3s = HEAD(512, 3) # T3S
+        self.h4 = HEAD(512, 3)  # T4
 
     def forward(self, B):
         t = self.txt(B["input_ids"], B["attention_mask"]).last_hidden_state[:, 0]
@@ -288,20 +300,44 @@ class MODEL(nn.Module):
             "t4": self.h4(z)
         }
 
-# ========================= LOSS (CE + WEIGHTS) =======================
+# ==================== LOSS (minority-aware) =======================
 
-def multi_task_loss(o, y, class_weights=None, device="cpu"):
+def focal_like_ce(logits, targets, alpha=None, gamma=2.0):
+    ce = F.cross_entropy(logits, targets, weight=alpha, reduction="none")
+    pt = torch.exp(-ce)
+    return ((1 - pt) ** gamma * ce).mean()
+
+def multi_task_loss(o, y, class_weights, device):
+    """
+    T1, T2 -> weighted CE
+    T3T, T3S, T4 -> weighted focal-CE with higher task scaling
+    """
     total = 0.0
+
+    task_scales = {
+        "t1": 1.0,
+        "t2": 1.0,
+        "t3t": 2.0,   # push hard on minority humanitarian types
+        "t3s": 1.7,
+        "t4": 1.3
+    }
+
     for k in y:
         m = y[k] >= 0
         if not m.any():
             continue
         logits = o[k][m]
         targets = y[k][m]
-        alpha = None
-        if class_weights is not None and k in class_weights:
-            alpha = class_weights[k].to(device)
-        total = total + F.cross_entropy(logits, targets, weight=alpha, reduction="mean")
+        alpha = class_weights.get(k, None)
+        alpha = alpha.to(device) if alpha is not None else None
+
+        if k in ["t1", "t2"]:
+            l = F.cross_entropy(logits, targets, weight=alpha, reduction="mean")
+        else:
+            l = focal_like_ce(logits, targets, alpha=alpha, gamma=2.0)
+
+        total = total + task_scales[k] * l
+
     return total
 
 # ========================= EVAL ON DEV ===========================
@@ -329,19 +365,18 @@ def evaluate(model, loader, device):
         if len(all_true[k]) == 0:
             continue
         print(f"\n--- TASK {k.upper()} ---")
-        rep = classification_report(all_true[k], all_preds[k], digits=4, zero_division=0)
-        print(rep)
+        rep_str = classification_report(all_true[k], all_preds[k], digits=4, zero_division=0)
+        print(rep_str)
         acc = accuracy_score(all_true[k], all_preds[k])
         print(f"Accuracy: {acc:.4f}")
         reports[k] = classification_report(all_true[k], all_preds[k], output_dict=True, zero_division=0)
 
-    # use T2 macro F1 as main score if available
     main_score = 0.0
     if "t2" in reports:
         main_score = reports["t2"]["macro avg"]["f1-score"]
     elif "t1" in reports:
         main_score = reports["t1"]["macro avg"]["f1-score"]
-    print(f"\n>>> Selected dev score = {main_score:.4f}\n")
+    print(f"\n>>> Selected dev score (T2 macro F1) = {main_score:.4f}\n")
     return main_score
 
 # ========================= TRAIN =============================
@@ -356,7 +391,7 @@ def train():
     class_weights = {
         "t1": make_weights(stats["t1"], 2),
         "t2": make_weights(stats["t2"], 3),
-        "t3t": make_weights(stats["t3t"], 3),
+        "t3t": make_weights(stats["t3t"], 2),  # 2 classes for T3T
         "t3s": make_weights(stats["t3s"], 3),
         "t4": make_weights(stats["t4"], 3),
     }
@@ -364,11 +399,26 @@ def train():
     for k, v in class_weights.items():
         print(k, v.tolist())
 
+    # ---- sampler weights ----
+    sample_weights = build_sample_weights(train_rows, stats, max_mult=10.0)
+    sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
+
     tok = RobertaTokenizerFast.from_pretrained("roberta-base")
     proc = AutoImageProcessor.from_pretrained("microsoft/swin-tiny-patch4-window7-224")
 
-    TL = DataLoader(CRISIS(train_rows, tok, proc), batch_size=8, shuffle=True,  collate_fn=collate)
-    DL = DataLoader(CRISIS(dev_rows,   tok, proc), batch_size=8, shuffle=False, collate_fn=collate)
+    TL = DataLoader(
+        CRISIS(train_rows, tok, proc),
+        batch_size=8,
+        sampler=sampler,
+        shuffle=False,
+        collate_fn=collate
+    )
+    DL = DataLoader(
+        CRISIS(dev_rows, tok, proc),
+        batch_size=8,
+        shuffle=False,
+        collate_fn=collate
+    )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("\n🟢 Using device:", device, "\n")
@@ -401,6 +451,7 @@ def train():
                 loss = multi_task_loss(out, Y, class_weights=class_weights, device=device)
 
             scaler.scale(loss).backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
             sched.step()
