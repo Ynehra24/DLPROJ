@@ -1,3 +1,19 @@
+#!/usr/bin/env python3
+"""
+FULL MULTIMODAL TRAINING SCRIPT — IMPROVED + EVAL
+Roberta + Swin on ITSACRISIS + CRISISIMAGES
+
+- Multi-task (t1, t2, t3t, t3s, t4)
+- Class weights with mild 1/sqrt(freq) scaling
+- Cross-entropy loss (no focal)
+- Mixed precision (GPU)
+- Cosine LR schedule with warmup
+- Dev evaluation every epoch (accuracy + F1 for all tasks)
+- Saves:
+    /kaggle/working/checkpoints_sota/E{epoch}.pt
+    /kaggle/working/checkpoints_sota/best.pt   (by T2 macro F1)
+"""
+
 # ========================== ENV FIX ==========================
 import os
 os.system("pip install --upgrade protobuf==3.20.3 transformers accelerate sentencepiece safetensors --quiet")
@@ -360,7 +376,7 @@ def train():
     model = MODEL().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=3e-5, weight_decay=1e-2)
 
-    epochs = 10
+    epochs = 30
     total_steps = len(TL) * epochs
     warmup_steps = int(0.03 * total_steps)
     sched = get_cosine_schedule_with_warmup(opt, warmup_steps, total_steps)
