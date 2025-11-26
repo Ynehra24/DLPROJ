@@ -1,19 +1,3 @@
-#!/usr/bin/env python3
-"""
-FULL MULTIMODAL TRAINING SCRIPT — IMPROVED + EVAL
-Roberta + Swin on ITSACRISIS + CRISISIMAGES
-
-- Multi-task (t1, t2, t3t, t3s, t4)
-- Class weights with mild 1/sqrt(freq) scaling
-- Cross-entropy loss (no focal)
-- Mixed precision (GPU)
-- Cosine LR schedule with warmup
-- Dev evaluation every epoch (accuracy + F1 for all tasks)
-- Saves:
-    /kaggle/working/checkpoints_sota/E{epoch}.pt
-    /kaggle/working/checkpoints_sota/best.pt   (by T2 macro F1)
-"""
-
 # ========================== ENV FIX ==========================
 import os
 os.system("pip install --upgrade protobuf==3.20.3 transformers accelerate sentencepiece safetensors --quiet")
