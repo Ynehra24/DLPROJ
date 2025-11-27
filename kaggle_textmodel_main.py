@@ -1,6 +1,9 @@
 # ========================== ENV FIX ==========================
+# (You can comment this out if protobuf errors are gone.)
 import os
-os.system("pip install --upgrade protobuf==3.20.3 transformers accelerate sentencepiece safetensors --quiet")
+os.system(
+    "pip install --upgrade protobuf==3.20.3 transformers accelerate sentencepiece safetensors --quiet"
+)
 
 # ========================== IMPORTS ==========================
 import glob, warnings
@@ -30,17 +33,17 @@ from sklearn.metrics import classification_report, accuracy_score
 BASE = "/kaggle/input/crisisman/ITSACRISIS/ITSACRISIS"
 
 DATA = {
-    "damage":{
-        "train":f"{BASE}/task_damage_text_img_train.tsv",
-        "dev":f"{BASE}/task_damage_text_img_dev.tsv"
+    "damage": {
+        "train": f"{BASE}/task_damage_text_img_train.tsv",
+        "dev":   f"{BASE}/task_damage_text_img_dev.tsv"
     },
-    "humanitarian":{
-        "train":f"{BASE}/task_humanitarian_text_img_train.tsv",
-        "dev":f"{BASE}/task_humanitarian_text_img_dev.tsv"
+    "humanitarian": {
+        "train": f"{BASE}/task_humanitarian_text_img_train.tsv",
+        "dev":   f"{BASE}/task_humanitarian_text_img_dev.tsv"
     },
-    "informative":{
-        "train":f"{BASE}/task_informative_text_img_train.tsv",
-        "dev":f"{BASE}/task_informative_text_img_dev.tsv"
+    "informative": {
+        "train": f"{BASE}/task_informative_text_img_train.tsv",
+        "dev":   f"{BASE}/task_informative_text_img_dev.tsv"
     }
 }
 
@@ -54,32 +57,46 @@ for p in tqdm(glob.glob(PATTERN), desc="Indexing images"):
     f = os.path.basename(p)
     if f.startswith("._"):
         continue
-    IMAGE_INDEX[f.replace(".jpg", "")] = p
+    key = f.rsplit(".jpg", 1)[0]
+    IMAGE_INDEX[key] = p
 
 print("\n📦 total images found =", len(IMAGE_INDEX))
 print(list(IMAGE_INDEX.items())[:5], "\n")
 
 # ========================== LABEL MAPS ============================
 
-DMAP = {'little_or_no_damage':0, 'mild_damage':1, 'severe_damage':2}
-
-T2MAP = {
-    'not_humanitarian':0, 'other_relevant_information':0,
-    'affected_individuals':1, 'injured_or_dead_people':1,
-    'missing_or_found_people':1, 'rescue_volunteering_or_donation_effort':1,
-    'infrastructure_and_utility_damage':2, 'vehicle_damage':2
+DMAP = {
+    'little_or_no_damage': 0,
+    'mild_damage':         1,
+    'severe_damage':       2
 }
 
-# T3T IS *BINARY* (0=infrastructure, 1=vehicle)
+T2MAP = {
+    'not_humanitarian':            0,
+    'other_relevant_information':  0,
+    'affected_individuals':        1,
+    'injured_or_dead_people':      1,
+    'missing_or_found_people':     1,
+    'rescue_volunteering_or_donation_effort': 1,
+    'infrastructure_and_utility_damage':      2,
+    'vehicle_damage':                            2
+}
+
+# T3TYPE = infra vs vehicle only → 2 classes (0,1)
 T3TYPE = {
-    'infrastructure_and_utility_damage':0,
-    'vehicle_damage':1
+    'infrastructure_and_utility_damage': 0,
+    'vehicle_damage':                    1
 }
 
 T4MAP = {
-    'affected_individuals':0, 'injured_or_dead_people':0, 'missing_or_found_people':0,
-    'rescue_volunteering_or_donation_effort':1, 'other_relevant_information':2,
-    'not_humanitarian':2, 'infrastructure_and_utility_damage':2, 'vehicle_damage':2
+    'affected_individuals':        0,
+    'injured_or_dead_people':      0,
+    'missing_or_found_people':     0,
+    'rescue_volunteering_or_donation_effort': 1,
+    'other_relevant_information':           2,
+    'not_humanitarian':                     2,
+    'infrastructure_and_utility_damage':    2,
+    'vehicle_damage':                       2
 }
 
 # ======================= TSV LOADING ==============================
@@ -90,8 +107,8 @@ def read_tsv(path):
         rows = [l.strip().split("\t") for l in f]
     return hdr, rows
 
-def find(h, c):
-    for x in c:
+def find(h, cands):
+    for x in cands:
         if x in h:
             return x
     return h[0]
@@ -108,11 +125,11 @@ def load_all():
 
             for r in rows:
                 d = {hdr[i]: r[i] if i < len(r) else "" for i in range(len(hdr))}
-                img_id = d[IMG].replace(".jpg", "")
+                img_id = d[IMG].replace(".jpg", "").replace(".jpeg", "")
 
                 item = {
                     "tweet": d[TXT],
-                    "img": IMAGE_INDEX.get(img_id, None),
+                    "img":   IMAGE_INDEX.get(img_id, None),
                     "t1": -1,
                     "t2": -1,
                     "t3t": -1,
@@ -127,9 +144,9 @@ def load_all():
                     if task == "damage":
                         item["t3s"] = DMAP.get(lab, -1)
                     if task == "humanitarian":
-                        item["t2"]  = T2MAP.get(lab, -1)
+                        item["t2"]  = T2MAP.get(lab,  -1)
                         item["t3t"] = T3TYPE.get(lab, -1)
-                        item["t4"]  = T4MAP.get(lab, -1)
+                        item["t4"]  = T4MAP.get(lab,  -1)
 
                 (TRAIN if split == "train" else DEV).append(item)
 
@@ -154,37 +171,15 @@ def compute_class_stats(train_rows):
     return stats
 
 def make_weights(counter, num_classes):
-    # milder weighting: 1 / sqrt(freq + 1)
+    """
+    Milder weighting: 1 / sqrt(freq + 1), normalized to mean=1.
+    """
     import math
     freqs = torch.tensor([counter.get(i, 0) for i in range(num_classes)], dtype=torch.float32)
     freqs = freqs + 1.0
     inv = 1.0 / torch.sqrt(freqs)
     inv = inv / inv.mean()
     return inv
-
-# ---- per-sample weights for WeightedRandomSampler ----
-def build_sample_weights(train_rows, stats, max_mult=10.0):
-    """
-    Each sample gets a weight boosted if it has rare labels in any task.
-    Using ~sqrt(majority_freq / freq) per task, multiplicatively.
-    """
-    weights = []
-    for r in train_rows:
-        w = 1.0
-        for task in ["t1","t2","t3t","t3s","t4"]:
-            lbl = r[task]
-            if lbl < 0 or len(stats[task]) == 0:
-                continue
-            freq = stats[task][lbl]
-            maj_freq = max(stats[task].values())
-            # sqrt imbalance factor
-            if freq > 0:
-                factor = (maj_freq / float(freq)) ** 0.5
-                w *= factor
-        # clip insanely large weights
-        w = min(w, max_mult)
-        weights.append(w)
-    return torch.tensor(weights, dtype=torch.float32)
 
 # ======================= DATASET ================================
 
@@ -198,7 +193,7 @@ class CRISIS(Dataset):
             transforms.RandomHorizontalFlip()
         ])
 
-    def __len__(self): 
+    def __len__(self):
         return len(self.data)
 
     def __getitem__(self, i):
@@ -206,7 +201,7 @@ class CRISIS(Dataset):
 
         try:
             img = Image.open(d["img"]).convert("RGB") if d["img"] else Image.new("RGB", (224, 224))
-        except:
+        except Exception:
             img = Image.new("RGB", (224, 224))
 
         if torch.rand(1) < 0.4:
@@ -222,24 +217,22 @@ class CRISIS(Dataset):
         P = self.proc(images=img, return_tensors="pt")
 
         return {
-            "input_ids": T.input_ids[0],
+            "input_ids":      T.input_ids[0],
             "attention_mask": T.attention_mask[0],
-            "pixel_values": P.pixel_values[0]
+            "pixel_values":   P.pixel_values[0]
         }, {
-            "t1": torch.tensor(d["t1"]),
-            "t2": torch.tensor(d["t2"]),
-            "t3t": torch.tensor(d["t3t"]),
-            "t3s": torch.tensor(d["t3s"]),
-            "t4": torch.tensor(d["t4"])
+            "t1":  torch.tensor(d["t1"],  dtype=torch.long),
+            "t2":  torch.tensor(d["t2"],  dtype=torch.long),
+            "t3t": torch.tensor(d["t3t"], dtype=torch.long),
+            "t3s": torch.tensor(d["t3s"], dtype=torch.long),
+            "t4":  torch.tensor(d["t4"],  dtype=torch.long)
         }
 
 def collate(b):
     X, Y = zip(*b)
-    return {
-        k: torch.stack([x[k] for x in X]) for k in X[0]
-    }, {
-        k: torch.stack([y[k] for y in Y]) for k in Y[0]
-    }
+    batch_x = {k: torch.stack([x[k] for x in X]) for k in X[0]}
+    batch_y = {k: torch.stack([y[k] for y in Y]) for k in Y[0]}
+    return batch_x, batch_y
 
 # ========================= MODEL ===============================
 
@@ -249,94 +242,128 @@ class HEAD(nn.Module):
         self.m = nn.Sequential(
             nn.Linear(d, 256),
             nn.GELU(),
-            nn.Dropout(.2),
+            nn.Dropout(0.2),
             nn.Linear(256, o)
         )
     def forward(self, x):
         return self.m(x)
 
 class FUSE(nn.Module):
-    def __init__(self, d=512):
+    """
+    Cross-modal Transformer fusion with learnable CLS.
+    """
+    def __init__(self, d=512, layers=2, heads=8):
         super().__init__()
-        L = nn.TransformerEncoderLayer(
+        layer = nn.TransformerEncoderLayer(
             d_model=d,
-            nhead=8,
+            nhead=heads,
             batch_first=True,
-            dim_feedforward=d*4
+            dim_feedforward=d * 4,
+            dropout=0.1,
+            activation="gelu"
         )
-        self.enc = nn.TransformerEncoder(L, 2)
+        self.enc = nn.TransformerEncoder(layer, layers)
         self.cls = nn.Parameter(torch.randn(1, 1, d))
 
-    def forward(self, a, b):
-        B = a.size(0)
+    def forward(self, t, v):
+        B = t.size(0)
         cls = self.cls.expand(B, -1, -1)
-        seq = torch.cat([cls, a[:, None], b[:, None]], 1)
-        return self.enc(seq)[:, 0]
+        seq = torch.cat([cls, t[:, None], v[:, None]], dim=1)
+        out = self.enc(seq)
+        return out[:, 0]  # CLS token
 
 class MODEL(nn.Module):
     def __init__(self):
         super().__init__()
+        # Encoders
         self.txt = RobertaModel.from_pretrained("roberta-base")
         self.txt.pooler = None  # avoid unused pooler warning
         self.vis = SwinModel.from_pretrained("microsoft/swin-tiny-patch4-window7-224")
+
+        # Projections
         self.tp = nn.Linear(self.txt.config.hidden_size, 512)
         self.vp = nn.Linear(self.vis.config.hidden_size, 512)
-        self.f = FUSE(512)
-        self.h1 = HEAD(512, 2)  # T1
-        self.h2 = HEAD(512, 3)  # T2
-        self.h3t = HEAD(512, 2) # T3T (binary)  << FIXED
-        self.h3s = HEAD(512, 3) # T3S
-        self.h4 = HEAD(512, 3)  # T4
+
+        # Fusion
+        self.fuse = FUSE(512, layers=2, heads=8)
+
+        # Shared representation
+        self.shared_norm = nn.LayerNorm(512)
+
+        # T3 expert gate
+        self.t3_gate = nn.Sequential(
+            nn.Linear(512, 512),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.LayerNorm(512)
+        )
+
+        # Heads
+        self.h1  = HEAD(512, 2)  # t1: binary
+        self.h2  = HEAD(512, 3)  # t2: 3-way
+        self.h3t = HEAD(512, 2)  # t3-type: 2-way (infra vs vehicle)
+        self.h3s = HEAD(512, 3)  # t3-severity: 3-way
+        self.h4  = HEAD(512, 3)  # t4: 3-way
 
     def forward(self, B):
-        t = self.txt(B["input_ids"], B["attention_mask"]).last_hidden_state[:, 0]
-        v = self.vis(pixel_values=B["pixel_values"]).last_hidden_state.mean(1)
-        z = self.f(self.tp(t), self.vp(v))
+        txt_out = self.txt(B["input_ids"], B["attention_mask"])
+        t = txt_out.last_hidden_state[:, 0]  # CLS
+
+        vis_out = self.vis(pixel_values=B["pixel_values"])
+        v = vis_out.last_hidden_state.mean(1)
+
+        t_proj = self.tp(t)
+        v_proj = self.vp(v)
+
+        z = self.fuse(t_proj, v_proj)
+        z = self.shared_norm(z)
+
+        z_t3 = self.t3_gate(z)
+
         return {
-            "t1": self.h1(z),
-            "t2": self.h2(z),
-            "t3t": self.h3t(z),
-            "t3s": self.h3s(z),
-            "t4": self.h4(z)
+            "t1":  self.h1(z),
+            "t2":  self.h2(z),
+            "t3t": self.h3t(z_t3),
+            "t3s": self.h3s(z_t3),
+            "t4":  self.h4(z)
         }
 
-# ==================== LOSS (minority-aware) =======================
+# ========================= LOSS HELPERS =======================
 
-def focal_like_ce(logits, targets, alpha=None, gamma=2.0):
-    ce = F.cross_entropy(logits, targets, weight=alpha, reduction="none")
-    pt = torch.exp(-ce)
-    return ((1 - pt) ** gamma * ce).mean()
-
-def multi_task_loss(o, y, class_weights, device):
+def focal_loss(logits, targets, weight=None, gamma=2.0):
     """
-    T1, T2 -> weighted CE
-    T3T, T3S, T4 -> weighted focal-CE with higher task scaling
+    Standard focal loss on top of cross-entropy.
+    """
+    ce = F.cross_entropy(logits, targets, weight=weight, reduction="none")
+    pt = torch.exp(-ce)
+    loss = ((1 - pt) ** gamma) * ce
+    return loss.mean()
+
+def multi_task_loss(outputs, labels, class_weights, device):
+    """
+    - t1, t2, t4 → standard CE + weights
+    - t3t, t3s   → focal + stronger weight
     """
     total = 0.0
-
-    task_scales = {
-        "t1": 1.0,
-        "t2": 1.0,
-        "t3t": 2.0,   # push hard on minority humanitarian types
-        "t3s": 1.7,
-        "t4": 1.3
-    }
-
-    for k in y:
-        m = y[k] >= 0
-        if not m.any():
+    for k in labels.keys():
+        mask = labels[k] >= 0
+        if not mask.any():
             continue
-        logits = o[k][m]
-        targets = y[k][m]
-        alpha = class_weights.get(k, None)
-        alpha = alpha.to(device) if alpha is not None else None
 
-        if k in ["t1", "t2"]:
-            l = F.cross_entropy(logits, targets, weight=alpha, reduction="mean")
+        logits = outputs[k][mask]
+        targets = labels[k][mask]
+        w = None
+        if class_weights is not None and k in class_weights and class_weights[k] is not None:
+            w = class_weights[k].to(device)
+
+        if k in ["t3t", "t3s"]:
+            # heavier focus for minority damage tasks
+            loss_k = focal_loss(logits, targets, weight=w, gamma=2.5)
+            loss_k = loss_k * 1.7
         else:
-            l = focal_like_ce(logits, targets, alpha=alpha, gamma=2.0)
+            loss_k = F.cross_entropy(logits, targets, weight=w, reduction="mean")
 
-        total = total + task_scales[k] * l
+        total = total + loss_k
 
     return total
 
@@ -344,20 +371,20 @@ def multi_task_loss(o, y, class_weights, device):
 
 def evaluate(model, loader, device):
     model.eval()
-    all_preds = {k:[] for k in ["t1","t2","t3t","t3s","t4"]}
-    all_true  = {k:[] for k in ["t1","t2","t3t","t3s","t4"]}
+    all_preds = {k: [] for k in ["t1", "t2", "t3t", "t3s", "t4"]}
+    all_true  = {k: [] for k in ["t1", "t2", "t3t", "t3s", "t4"]}
 
     with torch.no_grad():
         for B, Y in loader:
-            B = {k:v.to(device) for k,v in B.items()}
+            B = {k: v.to(device) for k, v in B.items()}
             out = model(B)
             for k in all_preds:
                 mask = Y[k] >= 0
                 if mask.any():
                     preds = out[k][mask].argmax(1).cpu().tolist()
                     labels = Y[k][mask].cpu().tolist()
-                    all_preds[k] += preds
-                    all_true[k]  += labels
+                    all_preds[k].extend(preds)
+                    all_true[k].extend(labels)
 
     reports = {}
     print("\n================= DEV RESULTS =================\n")
@@ -365,19 +392,33 @@ def evaluate(model, loader, device):
         if len(all_true[k]) == 0:
             continue
         print(f"\n--- TASK {k.upper()} ---")
-        rep_str = classification_report(all_true[k], all_preds[k], digits=4, zero_division=0)
-        print(rep_str)
+        rep_text = classification_report(all_true[k], all_preds[k], digits=4, zero_division=0)
+        print(rep_text)
         acc = accuracy_score(all_true[k], all_preds[k])
         print(f"Accuracy: {acc:.4f}")
-        reports[k] = classification_report(all_true[k], all_preds[k], output_dict=True, zero_division=0)
+        rep_dict = classification_report(all_true[k], all_preds[k], output_dict=True, zero_division=0)
+        reports[k] = rep_dict
 
-    main_score = 0.0
-    if "t2" in reports:
-        main_score = reports["t2"]["macro avg"]["f1-score"]
-    elif "t1" in reports:
-        main_score = reports["t1"]["macro avg"]["f1-score"]
-    print(f"\n>>> Selected dev score (T2 macro F1) = {main_score:.4f}\n")
-    return main_score
+    # Weighted macro-F1 across tasks, with emphasis on humanitarian + damage
+    weights = {
+        "t1":  1.0,
+        "t2":  2.0,
+        "t3t": 2.0,
+        "t3s": 2.0,
+        "t4":  1.5
+    }
+    total_score = 0.0
+    total_w = 0.0
+    for k, rep in reports.items():
+        if "macro avg" in rep:
+            f1 = rep["macro avg"]["f1-score"]
+            w = weights.get(k, 1.0)
+            total_score += w * f1
+            total_w += w
+
+    main_score = total_score / total_w if total_w > 0 else 0.0
+    print(f"\n>>> Combined dev score (weighted macro F1) = {main_score:.4f}\n")
+    return main_score, reports
 
 # ========================= TRAIN =============================
 
@@ -389,36 +430,42 @@ def train():
     print("Class stats:", stats)
 
     class_weights = {
-        "t1": make_weights(stats["t1"], 2),
-        "t2": make_weights(stats["t2"], 3),
-        "t3t": make_weights(stats["t3t"], 2),  # 2 classes for T3T
-        "t3s": make_weights(stats["t3s"], 3),
-        "t4": make_weights(stats["t4"], 3),
+        "t1":  make_weights(stats["t1"],  2) if len(stats["t1"])  > 0 else None,
+        "t2":  make_weights(stats["t2"],  3) if len(stats["t2"])  > 0 else None,
+        "t3t": make_weights(stats["t3t"], 2) if len(stats["t3t"]) > 0 else None,
+        "t3s": make_weights(stats["t3s"], 3) if len(stats["t3s"]) > 0 else None,
+        "t4":  make_weights(stats["t4"],  3) if len(stats["t4"])  > 0 else None,
     }
     print("Class weights:")
     for k, v in class_weights.items():
-        print(k, v.tolist())
+        if v is None:
+            print(k, None)
+        else:
+            print(k, v.tolist())
 
-    # ---- sampler weights ----
-    sample_weights = build_sample_weights(train_rows, stats, max_mult=10.0)
+    # ---- sampler weights: oversample T3 + humanitarian damage ----
+    sample_weights = []
+    for r in train_rows:
+        w = 1.0
+        if r["t3t"] >= 0:
+            w *= 4.0   # strongly boost t3-type rows
+        if r["t3s"] >= 0:
+            w *= 3.0   # boost severity rows
+        if r["t2"] == 2:
+            w *= 2.0   # humanitarian damage (rare-ish)
+        sample_weights.append(w)
     sampler = WeightedRandomSampler(sample_weights, num_samples=len(sample_weights), replacement=True)
 
-    tok = RobertaTokenizerFast.from_pretrained("roberta-base")
+    tok  = RobertaTokenizerFast.from_pretrained("roberta-base")
     proc = AutoImageProcessor.from_pretrained("microsoft/swin-tiny-patch4-window7-224")
 
-    TL = DataLoader(
-        CRISIS(train_rows, tok, proc),
-        batch_size=8,
-        sampler=sampler,
-        shuffle=False,
-        collate_fn=collate
-    )
-    DL = DataLoader(
-        CRISIS(dev_rows, tok, proc),
-        batch_size=8,
-        shuffle=False,
-        collate_fn=collate
-    )
+    train_ds = CRISIS(train_rows, tok, proc)
+    dev_ds   = CRISIS(dev_rows,   tok, proc)
+
+    TL = DataLoader(train_ds, batch_size=8, sampler=sampler, shuffle=False,
+                    collate_fn=collate, num_workers=0)
+    DL = DataLoader(dev_ds,   batch_size=8, shuffle=False,
+                    collate_fn=collate, num_workers=0)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("\n🟢 Using device:", device, "\n")
@@ -426,7 +473,7 @@ def train():
     model = MODEL().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=3e-5, weight_decay=1e-2)
 
-    epochs = 30
+    epochs = 60
     total_steps = len(TL) * epochs
     warmup_steps = int(0.03 * total_steps)
     sched = get_cosine_schedule_with_warmup(opt, warmup_steps, total_steps)
@@ -439,44 +486,44 @@ def train():
 
     for ep in range(epochs):
         model.train()
-        total = 0.0
+        total_loss = 0.0
 
         for B, Y in tqdm(TL, desc=f"Epoch {ep+1}/{epochs}"):
             B = {k: v.to(device) for k, v in B.items()}
             Y = {k: v.to(device) for k, v in Y.items()}
-            opt.zero_grad()
+            opt.zero_grad(set_to_none=True)
 
             with torch.cuda.amp.autocast(enabled=(device == "cuda")):
                 out = model(B)
                 loss = multi_task_loss(out, Y, class_weights=class_weights, device=device)
 
             scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(opt)
             scaler.update()
             sched.step()
 
-            total += loss.item()
+            total_loss += loss.item()
 
-        print(f"\n🟣 Epoch {ep+1} Train Loss = {total/len(TL):.4f}\n")
+        print(f"\n🟣 Epoch {ep+1} Train Loss = {total_loss/len(TL):.4f}\n")
 
         # ---- dev eval ----
-        dev_score = evaluate(model, DL, device)
+        dev_score, _ = evaluate(model, DL, device)
 
         # ---- save epoch checkpoint ----
         ep_path = f"/kaggle/working/checkpoints_sota/E{ep+1}.pt"
         torch.save(model.state_dict(), ep_path)
         print("💾 Saved epoch checkpoint:", ep_path)
 
-        # ---- save best by T2 macro F1 ----
+        # ---- save best by combined macro F1 ----
         if dev_score > best_score:
             best_score = dev_score
             best_path = "/kaggle/working/checkpoints_sota/best.pt"
             torch.save(model.state_dict(), best_path)
             print(f"🏆 New best model (score={best_score:.4f}) saved to:", best_path)
 
-    print("\nTraining done. Best dev score =", best_score, "at", best_path)
+    print("\nTraining done. Best combined dev score =", best_score, "at", best_path)
 
 # ========================= RUN =============================
 
-train()
+if __name__ == "__main__":
+    train()
