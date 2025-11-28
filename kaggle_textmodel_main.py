@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-ITSACRISIS MULTIMODAL TRAINER — CUDA VERSION (NO HF IMAGE PROCESSORS)
-
-- Text: roberta-base
-- Image: microsoft/swin-tiny-patch4-window7-224
-- Image preprocessing: torchvision only
-- Multi-task heads: t1, t2, t3t, t3s, t4
-- Checkpoints: /kaggle/working/checkpoints_sota
-- Auto upload to Kaggle dataset: yathnehr/itsacrisis-checkpoints (if kagglehub available)
-"""
-
 import os
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"  # sync CUDA errors to the real call site
 
