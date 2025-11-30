@@ -1,312 +1,426 @@
-###############################################################
-#   🚀 T2 FUSION (RoBERTa-base + CLIP ViT-B/32)
-#   ✅ Better training (less freezing, stronger head)
-#   ✅ Class weights + sampler
-#   ✅ AMP (no deprecation warnings if torch>=2.0)
-###############################################################
+############################################################
+#   TASK 2 — HUMAN / STRUCTURE / NON-INFO FUSION (T2T+T2S)
+############################################################
 
-from google.colab import drive
-drive.mount('/content/drive')
-print("🔗 Drive Mounted")
-
-import os, random, torch, numpy as np, pandas as pd
-import torch.nn as nn
-from tqdm.auto import tqdm
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
-from sklearn.model_selection import train_test_split
-from sklearn.utils.class_weight import compute_class_weight
-from sklearn.metrics import f1_score, classification_report
-from transformers import AutoTokenizer, AutoModel, CLIPModel, CLIPProcessor
+import os, random, numpy as np, pandas as pd
+from collections import Counter
 from PIL import Image
 
-# use torch.amp if available (Torch 2.x), else fallback to cuda.amp
-try:
-    from torch.amp import autocast, GradScaler
-    AMP_KW = dict(device_type="cuda", dtype=torch.float16)
-except Exception:
-    from torch.cuda.amp import autocast, GradScaler
-    AMP_KW = dict()
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from tqdm.auto import tqdm
+from sklearn.metrics import f1_score, confusion_matrix, classification_report
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-print("💻 Device:", device)
+import timm
+import torchvision.transforms as T
+from transformers import AutoTokenizer, AutoModel
 
-############################
-#  ⚙ CONFIG
-############################
-IMG_SIZE     = 168
-EPOCHS       = 10
-ACCUM_STEPS  = 2
-LR           = 3e-5       # 🔥 higher LR than before (was 8e-6)
-BATCH_SIZE   = 8
-VAL_BS       = 16
-SEED         = 42
+# ================== CONFIG ==================
+DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-SAVE = "/content/drive/MyDrive/crisis_models/T2_FUSION_BETTER.pt"
-os.makedirs(os.path.dirname(SAVE), exist_ok=True)
+IMG_ROOT    = "/kaggle/input/crisisman/CRISISIMAGES/CRISISIMAGES"
+TSV_ROOT    = "/kaggle/input/crisisman/ITSACRISIS/ITSACRISIS"
 
-############################
-#  SEEDING
-############################
-def set_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = False
-    torch.backends.cudnn.benchmark = True
+TRAIN_TSV   = os.path.join(TSV_ROOT, "task_humanitarian_text_img_train.tsv")
+DEV_TSV     = os.path.join(TSV_ROOT, "task_humanitarian_text_img_dev.tsv")
+TEST_TSV    = os.path.join(TSV_ROOT, "task_humanitarian_text_img_test.tsv")
 
-set_seed(SEED)
+TEXT_COL    = "tweet_text"
+IMG_COL     = "image"
+LABEL_COL   = "label_text"   # humanitarian label from text side
 
-############################
-#  LOAD DATA
-############################
-BASE="/content/drive/MyDrive/crisismmd_datasplit_all"
-IMG="/content/drive/MyDrive/data_image"
+NUM_CLASSES = 3
+IMG_SIZE    = 256
+MAX_LEN     = 96
+BATCH_SIZE  = 8
 
-hum=pd.read_csv(f"{BASE}/task_humanitarian_text_img_train.tsv",sep="\t")
-dam=pd.read_csv(f"{BASE}/task_damage_text_img_train.tsv",sep="\t")
-inf=pd.read_csv(f"{BASE}/task_informative_text_img_train.tsv",sep="\t")
+EPOCHS_T2T  = 6
+EPOCHS_T2S  = 10
+PATIENCE    = 3
 
-df=pd.concat([hum,dam,inf],ignore_index=True)
+LR_TXT      = 2e-5
+LR_HEAD_T2T = 4e-4
 
-def map_t2(x):
-    x=x.lower()
-    if "not_humanitarian" in x or "not_informative" in x: 
-        return 0
-    if any(z in x for z in ["infra","damage","vehicle","severe","mild"]):
-        return 2
-    return 1
+LR_IMG      = 3e-5
+LR_HEAD_T2S = 8e-4
 
-df["t2"]=df["label"].apply(map_t2)
-print("\n📊 LABEL COUNTS:\n",df["t2"].value_counts(),"\n")
+BACKBONE_IMG = "convnext_tiny"
 
-############################
-#  INDEX IMAGES
-############################
-IMG_INDEX={}
-for r,_,files in os.walk(IMG):
-    for f in files:
-        if f.lower().endswith(("jpg","png","jpeg")):
-            IMG_INDEX[f.split('.')[0]] = os.path.join(r,f)
+print("🟢 DEVICE =", DEVICE)
+random.seed(42); np.random.seed(42); torch.manual_seed(42); torch.cuda.manual_seed_all(42)
 
-print("📦 Images indexed:",len(IMG_INDEX))
+# ================== LOAD TSVs ==================
+print("\n📂 Loading Task 2 TSVs...")
+df_train = pd.read_csv(TRAIN_TSV, sep="\t")
+df_dev   = pd.read_csv(DEV_TSV,   sep="\t")
+df_test  = pd.read_csv(TEST_TSV,  sep="\t")
 
-############################
-#  TOKENIZER + CLIP
-############################
-print("🔤 Loading tokenizer...")
-tok  = AutoTokenizer.from_pretrained("roberta-base")
+print("Train columns:", df_train.columns.tolist())
 
-print("🖼 Loading CLIP processor...")
-proc = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+# map 8-way humanitarian labels -> 3-way Task 2 labels
+def map_to_task2(lbl: str) -> str:
+    if lbl in [
+        "affected_individuals",
+        "injured_or_dead_people",
+        "missing_or_found_people",
+        "rescue_volunteering_or_donation_effort",
+    ]:
+        return "humanitarian"
+    elif lbl in [
+        "infrastructure_and_utility_damage",
+        "vehicle_damage",
+    ]:
+        return "structure"
+    else:
+        # "not_humanitarian" and "other_relevant_information"
+        return "non_informative"
 
-############################
-#  DATASET
-############################
-class FusionDS(Dataset):
-    def __init__(self,df):
+for df in (df_train, df_dev, df_test):
+    df["t2_label"] = df[LABEL_COL].apply(map_to_task2)
+
+labels = ["humanitarian", "non_informative", "structure"]
+label2id = {lab:i for i, lab in enumerate(labels)}
+id2label = {i:lab for lab, i in label2id.items()}
+print("Label2id:", label2id)
+
+df_train["label_id"] = df_train["t2_label"].map(label2id)
+df_dev["label_id"]   = df_dev["t2_label"].map(label2id)
+df_test["label_id"]  = df_test["t2_label"].map(label2id)
+
+print("Train counts:", Counter(df_train.label_id))
+
+# ================== TFMS & TOKENIZER ==========
+train_tfms = T.Compose([
+    T.Resize((IMG_SIZE+16, IMG_SIZE+16)),
+    T.RandomResizedCrop(IMG_SIZE, scale=(0.75, 1.0)),
+    T.RandomHorizontalFlip(),
+    T.RandomRotation(10),
+    T.ColorJitter(0.2, 0.2, 0.2),
+    T.ToTensor(),
+    T.Normalize([.485,.456,.406],[.229,.224,.225])
+])
+
+eval_tfms = T.Compose([
+    T.Resize((IMG_SIZE, IMG_SIZE)),
+    T.ToTensor(),
+    T.Normalize([.485,.456,.406],[.229,.224,.225])
+])
+
+tokenizer = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+
+# ================== DATASETS ===================
+class T2TextDataset(Dataset):
+    def __init__(self, df):
         self.df = df.reset_index(drop=True)
 
-    def __len__(self): 
-        return len(self.df)
+    def __len__(self): return len(self.df)
 
-    def __getitem__(self,i):
-        r = self.df.iloc[i]
+    def __getitem__(self, i):
+        row = self.df.iloc[i]
+        text = str(row[TEXT_COL])
+        y    = int(row["label_id"])
 
-        # text
-        enc = tok(
-            r["tweet_text"],
+        enc = tokenizer(
+            text,
+            max_length=MAX_LEN,
             padding="max_length",
             truncation=True,
-            max_length=192,
             return_tensors="pt"
         )
-        ids  = enc["input_ids"][0]
-        mask = enc["attention_mask"][0]
+        input_ids      = enc["input_ids"].squeeze(0)
+        attention_mask = enc["attention_mask"].squeeze(0)
 
-        # image
-        imgid = str(r["image"]).split('.')[0]
-        p = IMG_INDEX.get(imgid,None)
-        if p and os.path.exists(p):
-            img = Image.open(p).convert("RGB")
-        else:
-            img = Image.new("RGB",(IMG_SIZE,IMG_SIZE))
+        return {"input_ids": input_ids, "attention_mask": attention_mask}, torch.tensor(y, dtype=torch.long)
 
-        img = img.resize((IMG_SIZE,IMG_SIZE))
-        pix = proc(images=img,return_tensors="pt")["pixel_values"][0]
 
-        label = torch.tensor(r["t2"],dtype=torch.long)
-        return ids,mask,pix,label
+class T2ImageDataset(Dataset):
+    def __init__(self, df, train=True):
+        self.df = df.reset_index(drop=True)
+        self.train = train
 
-############################
-#  SPLIT + CLASS WEIGHTS
-############################
-train_df,val_df = train_test_split(
-    df,
-    test_size=0.15,
-    stratify=df["t2"],
-    random_state=SEED
-)
-y = train_df["t2"].values
+    def __len__(self): return len(self.df)
 
-weights = compute_class_weight(
-    class_weight="balanced",
-    classes=np.unique(y),
-    y=y
-)
-cw = torch.tensor(weights,dtype=torch.float32).to(device)
-print("⚖ Class weights:", cw.tolist())
+    def __getitem__(self, i):
+        row = self.df.iloc[i]
+        img_rel = row[IMG_COL]
+        y       = int(row["label_id"])
 
-sampler = WeightedRandomSampler(
-    weights=[cw[c].item() for c in y],
-    num_samples=len(y),
-    replacement=True
-)
+        path = os.path.join(IMG_ROOT, img_rel)
+        try:
+            img = Image.open(path).convert("RGB")
+        except:
+            img = Image.new("RGB", (IMG_SIZE, IMG_SIZE), (0,0,0))
 
-train_loader = DataLoader(
-    FusionDS(train_df),
-    batch_size=BATCH_SIZE,
-    sampler=sampler,
-    pin_memory=True,
-    num_workers=2
-)
-val_loader   = DataLoader(
-    FusionDS(val_df),
-    batch_size=VAL_BS,
-    shuffle=False,
-    pin_memory=True,
-    num_workers=2
-)
+        img = train_tfms(img) if self.train else eval_tfms(img)
+        return img, torch.tensor(y, dtype=torch.long)
 
-############################
-#  FUSION MODEL
-############################
-class Fusion(nn.Module):
+# text
+train_ds_txt = T2TextDataset(df_train)
+dev_ds_txt   = T2TextDataset(df_dev)
+test_ds_txt  = T2TextDataset(df_test)
+
+train_loader_txt = DataLoader(train_ds_txt, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=0, pin_memory=True)
+dev_loader_txt   = DataLoader(dev_ds_txt,   batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=0, pin_memory=True)
+test_loader_txt  = DataLoader(test_ds_txt,  batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=0, pin_memory=True)
+
+# image
+train_ds_img = T2ImageDataset(df_train, train=True)
+dev_ds_img   = T2ImageDataset(df_dev,   train=False)
+test_ds_img  = T2ImageDataset(df_test,  train=False)
+
+labels_train = df_train.label_id.to_numpy()
+class_counts = np.bincount(labels_train)
+inv = 1.0 / np.maximum(class_counts, 1)
+w_classes = inv / inv.mean()
+sample_w = w_classes[labels_train]
+sampler = WeightedRandomSampler(sample_w, len(sample_w), replacement=True)
+
+train_loader_img = DataLoader(train_ds_img, batch_size=BATCH_SIZE, sampler=sampler,
+                              num_workers=0, pin_memory=True)
+dev_loader_img   = DataLoader(dev_ds_img,   batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=0, pin_memory=True)
+test_loader_img  = DataLoader(test_ds_img,  batch_size=BATCH_SIZE, shuffle=False,
+                              num_workers=0, pin_memory=True)
+
+print("\n✅ Task 2 text & image dataloaders ready")
+
+# ================== MODELS =====================
+class T2TextModel(nn.Module):
     def __init__(self):
         super().__init__()
-        print("🧠 Loading RoBERTa-base...")
-        self.txt = AutoModel.from_pretrained("roberta-base")
-
-        print("👁  Loading CLIP (ViT-B/32)...")
-        self.vis = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-
-        # 🔒 Freeze fewer layers than before – still faster, but more capacity
-        for name,p in self.txt.named_parameters():
-            if any(f"encoder.layer.{i}" in name for i in range(6)):  # 0–5 frozen
-                p.requires_grad=False
-
-        # freeze only very early CLIP blocks
-        for name,p in self.vis.vision_model.named_parameters():
-            if "layers.0" in name:        # only block0
-                p.requires_grad=False
-
-        # 🔁 Projection to smaller fusion space
-        self.txt_proj = nn.Sequential(
-            nn.Linear(768,512),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Dropout(0.2)
+        self.txt = AutoModel.from_pretrained("distilbert-base-uncased")
+        H = self.txt.config.hidden_size
+        self.ln = nn.LayerNorm(H)
+        self.head = nn.Sequential(
+            nn.Linear(H, 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256, NUM_CLASSES),
         )
-        self.img_proj = nn.Sequential(
-            nn.Linear(768,512),
-            nn.LayerNorm(512),
-            nn.ReLU(),
-            nn.Dropout(0.2)
+
+    def forward(self, B):
+        out = self.txt(
+            input_ids=B["input_ids"],
+            attention_mask=B["attention_mask"]
+        ).last_hidden_state
+        cls = out[:, 0, :]
+        cls = self.ln(cls)
+        return self.head(cls)
+
+
+class T2ImageModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.img = timm.create_model(
+            BACKBONE_IMG,
+            pretrained=True,
+            num_classes=0,
+            drop_path_rate=0.1,
         )
+        with torch.no_grad():
+            d = self.img(torch.zeros(1,3,IMG_SIZE,IMG_SIZE)).shape[-1]
+        print("🔍 Task2 image feat dim:", d)
 
         self.head = nn.Sequential(
-            nn.Linear(512+512,512),
-            nn.ReLU(),
+            nn.Linear(d, 512),
+            nn.GELU(),
+            nn.Dropout(0.4),
+            nn.Linear(512, 256),
+            nn.GELU(),
             nn.Dropout(0.3),
-            nn.Linear(512,256),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256,3)
+            nn.Linear(256, NUM_CLASSES),
         )
 
-    def forward(self,ids,mask,pix):
-        t_out = self.txt(ids,mask).last_hidden_state[:,0]  # [CLS]
-        v_out = self.vis.vision_model(pix).pooler_output
+    def forward(self, x):
+        feat = self.img(x)
+        return self.head(feat)
 
-        t = self.txt_proj(t_out)
-        v = self.img_proj(v_out)
+# ================== TRAIN HELPERS =============
+def train_text_model():
+    model = T2TextModel().to(DEVICE)
+    inv = 1.0 / np.maximum(class_counts, 1)
+    w = inv / inv.mean()
+    class_weights = torch.tensor(w, dtype=torch.float32, device=DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-        x = torch.cat([t,v],dim=1)
-        logits = self.head(x)
-        return logits
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": model.txt.parameters(),  "lr": LR_TXT},
+            {"params": model.head.parameters(), "lr": LR_HEAD_T2T},
+        ],
+        weight_decay=0.01
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS_T2T)
 
-############################
-#  TRAIN
-############################
-model = Fusion().to(device)
-opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
-criterion = nn.CrossEntropyLoss(weight=cw, label_smoothing=0.03)
-scaler = GradScaler()
+    best_f1 = 0.0
+    wait    = 0
 
-best_f1 = 0.0
+    for epoch in range(1, EPOCHS_T2T+1):
+        print(f"\n===== T2T E{epoch}/{EPOCHS_T2T} =====")
+        model.train()
+        total_loss = 0.0
+        for B, y in tqdm(train_loader_txt, desc=f"T2T Train E{epoch}"):
+            y = y.to(DEVICE)
+            B = {k:v.to(DEVICE) for k,v in B.items()}
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(B)
+            loss   = criterion(logits, y)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total_loss += loss.item()
+        print("Train loss:", total_loss / len(train_loader_txt))
 
-for ep in range(1,EPOCHS+1):
-    model.train()
-    epoch_loss = 0.0
-    steps = 0
+        # dev
+        model.eval()
+        P, T_ = [], []
+        with torch.no_grad():
+            for B, y in tqdm(dev_loader_txt, desc="T2T Dev"):
+                B = {k:v.to(DEVICE) for k,v in B.items()}
+                logits = model(B)
+                preds  = logits.argmax(1).cpu().tolist()
+                P.extend(preds)
+                T_.extend(y.tolist())
+        f1 = f1_score(T_, P, average="macro", zero_division=0)
+        print("Dev F1:", f1)
+        print(confusion_matrix(T_, P))
 
-    loop = tqdm(train_loader, desc=f"🔥 FUSION E{ep}/{EPOCHS}")
-    opt.zero_grad(set_to_none=True)
+        scheduler.step()
+        if f1 > best_f1:
+            best_f1, wait = f1, 0
+            torch.save(model.state_dict(), "T2T_TEXT.pt")
+            print("💾 Saved T2T_TEXT.pt")
+        else:
+            wait += 1
+            if wait >= PATIENCE:
+                print("⛔ Early stop T2T")
+                break
+    print("Best T2T F1:", best_f1)
+    return best_f1
 
-    for i,(ids,mask,pix,labels) in enumerate(loop):
-        ids    = ids.to(device)
-        mask   = mask.to(device)
-        pix    = pix.to(device)
-        labels = labels.to(device)
+def train_image_model():
+    model = T2ImageModel().to(DEVICE)
+    inv = 1.0 / np.maximum(class_counts, 1)
+    w = inv / inv.mean()
+    class_weights = torch.tensor(w, dtype=torch.float32, device=DEVICE)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-        with autocast(**AMP_KW):
-            logits = model(ids,mask,pix)
-            loss = criterion(logits,labels)
-            loss = loss / ACCUM_STEPS
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": model.img.parameters(),  "lr": LR_IMG},
+            {"params": model.head.parameters(), "lr": LR_HEAD_T2S},
+        ],
+        weight_decay=0.01
+    )
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS_T2S)
 
-        scaler.scale(loss).backward()
-        steps += 1
+    best_f1 = 0.0
+    wait    = 0
 
-        if (i+1) % ACCUM_STEPS == 0:
-            scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(opt)
-            scaler.update()
-            opt.zero_grad(set_to_none=True)
+    for epoch in range(1, EPOCHS_T2S+1):
+        print(f"\n===== T2S E{epoch}/{EPOCHS_T2S} =====")
+        model.train()
+        total_loss = 0.0
+        for imgs, y in tqdm(train_loader_img, desc=f"T2S Train E{epoch}"):
+            imgs = imgs.to(DEVICE)
+            y    = y.to(DEVICE)
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(imgs)
+            loss   = criterion(logits, y)
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total_loss += loss.item()
+        print("Train loss:", total_loss / len(train_loader_img))
 
-        epoch_loss += loss.item() * ACCUM_STEPS
-        loop.set_postfix(loss=epoch_loss / steps)
+        model.eval()
+        P, T_ = [], []
+        with torch.no_grad():
+            for imgs, y in tqdm(dev_loader_img, desc="T2S Dev"):
+                imgs = imgs.to(DEVICE)
+                logits = model(imgs)
+                preds  = logits.argmax(1).cpu().tolist()
+                P.extend(preds)
+                T_.extend(y.tolist())
+        f1 = f1_score(T_, P, average="macro", zero_division=0)
+        print("Dev F1:", f1)
+        print(confusion_matrix(T_, P))
 
-    # ================= VAL =================
-    model.eval()
-    P,T = [],[]
-    with torch.no_grad():
-        for ids,mask,pix,labels in val_loader:
-            ids    = ids.to(device)
-            mask   = mask.to(device)
-            pix    = pix.to(device)
-            labels = labels.to(device)
+        scheduler.step()
+        if f1 > best_f1:
+            best_f1, wait = f1, 0
+            torch.save(model.state_dict(), "T2S_IMAGE.pt")
+            print("💾 Saved T2S_IMAGE.pt")
+        else:
+            wait += 1
+            if wait >= PATIENCE:
+                print("⛔ Early stop T2S")
+                break
+    print("Best T2S F1:", best_f1)
+    return best_f1
 
-            with autocast(**AMP_KW):
-                logits = model(ids,mask,pix)
-            preds = logits.argmax(1)
+# ================== TRAIN T2T & T2S =============
+best_t2t = train_text_model()
+best_t2s = train_image_model()
 
-            P += preds.cpu().tolist()
-            T += labels.cpu().tolist()
+# ================== FUSION (TASK 2) ============
+text_model  = T2TextModel().to(DEVICE)
+image_model = T2ImageModel().to(DEVICE)
+text_model.load_state_dict(torch.load("T2T_TEXT.pt",  map_location=DEVICE))
+image_model.load_state_dict(torch.load("T2S_IMAGE.pt", map_location=DEVICE))
+text_model.eval()
+image_model.eval()
 
-    macro_f1 = f1_score(T,P,average="macro")
-    print(f"\n🔥 VAL Macro F1 = {macro_f1:.4f}")
+def fuse_task2(text_logits, img_logits):
+    # F_humanstruct(t,i):
+    #   2 (structure)       if t==2 or i==2
+    #   0 (humanitarian)    elif t==0 or i==0
+    #   1 (non_informative) else
+    t_pred = text_logits.argmax(dim=1)
+    i_pred = img_logits.argmax(dim=1)
+    fused  = torch.empty_like(t_pred)
 
-    if macro_f1 > best_f1:
-        best_f1 = macro_f1
-        torch.save(model.state_dict(), SAVE)
-        print(f"⭐ NEW BEST ({best_f1:.4f}) → {SAVE}")
+    mask_struct = (t_pred == 2) | (i_pred == 2)
+    fused[mask_struct] = 2
 
-print("\n✅ TRAINING DONE")
-print("🏆 BEST VAL MACRO F1:", best_f1)
+    mask_human = ~mask_struct & ((t_pred == 0) | (i_pred == 0))
+    fused[mask_human] = 0
 
-############################
-#  OPTIONAL: DETAILED VAL REPORT
-############################
-print("\n📄 Validation classification report:")
-print(classification_report(T,P,digits=4))
+    mask_rest = ~(mask_struct | mask_human)
+    fused[mask_rest] = 1
+
+    return fused
+
+all_preds, all_true = [], []
+
+with torch.no_grad():
+    for (B_txt, y_txt), (imgs, y_img) in tqdm(
+        zip(test_loader_txt, test_loader_img),
+        desc="Task2 Fusion Test",
+        total=len(test_loader_txt)
+    ):
+        # assume loaders have same ordering
+        B_txt = {k:v.to(DEVICE) for k,v in B_txt.items()}
+        imgs  = imgs.to(DEVICE)
+
+        logits_txt = text_model(B_txt)
+        logits_img = image_model(imgs)
+
+        fused = fuse_task2(logits_txt, logits_img)
+        all_preds.extend(fused.cpu().tolist())
+        all_true.extend(y_txt.tolist())
+
+print("\n============== TASK 2 FUSION TEST RESULTS ==============")
+print(classification_report(
+    all_true,
+    all_preds,
+    digits=4,
+    target_names=[id2label[i] for i in range(NUM_CLASSES)],
+    zero_division=0,
+))
+print("Confusion matrix:\n", confusion_matrix(all_true, all_preds))
+print("Macro-F1:", f1_score(all_true, all_preds, average="macro", zero_division=0))
