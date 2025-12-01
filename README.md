@@ -97,12 +97,12 @@ This repo is a step in that direction: a **5-model system** trained on CrisisMMD
 
 ### **SEG – Siamese Damage Segmentation / Classifier**
 
-Implemented in `segmentation.ipynb` with a MiT-B1 backbone.
+Implemented in `segmentation.ipynb` with a MiT-B2 backbone.
 
 * **Inputs:** crop around a structure from **pre-disaster** and **post-disaster** satellite imagery
 * **Encoder:** `SiameseMiTEncoder`
 
-  * shared MiT-B1 encoder (from `segmentation_models_pytorch`)
+  * shared MiT-B2 encoder (from `segmentation_models_pytorch`)
   * each image → feature map `(B, 512, 7, 7)` → global average pooling → `(B, 512)`
 * **Fusion + classifier (`DamageClassifier`):**
 
