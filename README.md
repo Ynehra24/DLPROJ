@@ -143,11 +143,6 @@ The scripts `final_pipeline.ipynb` and `final_segmentandtweet_pipeline.py` conne
 
      * SEG’s **spatial damage map**, and
      * T1–T4 outputs (what people say + what images show)
-   * to identify regions with:
-
-     * high people_affected + high damage → **priority rescue**
-     * low damage + no_human → potential **safe zones / staging areas**.
-
 ---
 
 ## 📁 Repository Structure
