@@ -2,10 +2,10 @@
 
 # 🚨 DisasterAI – Multimodal Crisis Understanding
 
-DisasterAI is a fusion pipeline for **marking safe zones and understanding on-ground situations** during crises using:
+DisasterAI is a fusion pipeline for **marking safe zones and understanding on ground situations** during crises using:
 
 * social media posts (tweets + images)
-* satellite / aerial imagery (pre– and post-disaster)
+* satellite / aerial imagery (pre and post disaster)
 
 The repository contains **four classification models (T1–T4)** plus a **Siamese damage model (SEG)** and a **final integrated pipeline** that ties them together.
 
