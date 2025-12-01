@@ -244,9 +244,6 @@ python final_segmentandtweet_pipeline.py \
     --post post_disaster.png \
     --tweets tweets.json
 ```
-
-(If your scripts use different flags, you can adjust these examples.)
-
 ---
 
 ## 📊 Performance Summary
@@ -259,9 +256,12 @@ python final_segmentandtweet_pipeline.py \
 | **T4**  | F1 = **0.8502**          | Best overall; strong on no_human + rescue    |
 | **SEG** | Weighted F1 ≈ **0.8854** | Very effective at pre/post change detection  |
 
-(You can expand this with per-class F1 tables you already computed.)
-
 ---
+
+## Our Output - 
+<p align="center">
+  <img src="https://github.com/Ynehra24/DLPROJ/blob/main/pngimage.png" width="900">
+</p>
 
 ## 📌 Key Learnings
 
