@@ -1,5 +1,3 @@
----
-
 # 🚨 DisasterAI – Multimodal Crisis Understanding
 
 DisasterAI is a fusion pipeline for **marking safe zones and understanding on ground situations** during crises using:
