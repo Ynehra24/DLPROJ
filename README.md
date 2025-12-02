@@ -287,10 +287,12 @@ T1 Pred: 1 | True: 1 T2 Pred: 1 | True: 1 T3 Pred: 1 | True: 2 T4 Pred: 1 | True
 T1 Pred: 1 | True: 1 T2 Pred: 1 | True: 2 T3 Pred: 1 | True: 2 T4 Pred: 1 | True: 0
 
 ==================== FINAL SCORES ====================
+
 T1: 0.95
 T2: 0.52
 T3: 0.86
 T4: 0.99
+
 ======================================================
 
 ## 📌 Key Learnings
