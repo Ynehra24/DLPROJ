@@ -36,7 +36,7 @@ CONV_IMG_SIZE = 256
 MAX_LEN = 96
 
 OPENROUTER_API_URL = "https://api.openrouter.ai/v1/chat/completions"
-DEFAULT_MODEL = "gpt-4o-mini"
+DEFAULT_MODEL = "qwen/qwen3-235b-a22b-2507"
 
 # ------------------------------------------------------------------
 # OpenRouter wrapper
