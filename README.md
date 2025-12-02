@@ -28,7 +28,7 @@ This repo is a step in that direction: a **5-model system** trained on CrisisMMD
 | Model                                | Input                     | Output                          | Purpose                                     |
 | ------------------------------------ | ------------------------- | ------------------------------- | ------------------------------------------- |
 | **T1 – Fusion Relevance Classifier** | Tweet text + tweet image  | Informative / Non-Informative   | Filters crisis data that is actually useful |
-| **T2 – Humanitarian**                | Tweet text + image        | Humanitarian / Structure / None | High-recall humanitarian signal extraction  |
+| **T2 – Humanitarian**                | Tweet text                | Humanitarian / Structure / None | High-recall humanitarian signal extraction  |
 | **T3 – Light Multimodal Damage**     | Tweet text + image        | Little / Mild / Severe damage   | Damage severity estimation around events    |
 | **T4 – Multimodal Subtypes**         | Tweet text + image        | People_Affected / Rescue / None | Distinguishes people vs rescue vs no-human  |
 | **SEG – Siamese Damage Classifier**  | Pre + Post satellite crop | No / Minor / Major / Destroyed  | Structure-level change / damage reasoning   |
