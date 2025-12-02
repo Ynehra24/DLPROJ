@@ -12,16 +12,20 @@ import numpy as np
 try:
     import torch
     from torchvision import transforms
-    from transformers import (
-        RobertaTokenizerFast,
-        AutoTokenizer,
-        AutoModel,
-        CLIPModel
-    )
+    from transformers import AutoTokenizer, AutoModel, CLIPModel
     import timm
     import torch.nn as nn
 except Exception as e:
-    st.error("Import error: " + str(e))
+    import traceback
+    err = traceback.format_exc()
+    st.write("Import error detected:")
+    st.code(err)
+    # Continue, UI will still render
+
+# ------------------------------------------------------------------
+# Streamlit page config (must be FIRST)
+# ------------------------------------------------------------------
+st.set_page_config(page_title="CrisisMMD Assistant", layout="wide")
 
 # ------------------------------------------------------------------
 # Minimal configuration
@@ -42,7 +46,7 @@ def call_openrouter(api_key: str, messages: List[Dict[str, str]],
                     max_tokens: int = 512,
                     temperature: float = 0.2):
 
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    headers = {"Content-Type": "application/json", "Authorization": "Bearer " + api_key}
     body = {
         "model": model,
         "messages": messages,
@@ -67,7 +71,6 @@ T4: ConvNeXt-Tiny + DistilBERT -> 3-class human presence.
 # ------------------------------------------------------------------
 # Streamlit UI
 # ------------------------------------------------------------------
-st.set_page_config(page_title="CrisisMMD Assistant", layout="wide")
 st.title("CrisisMMD 4-task Assistant (Clean Cloud-Friendly Version)")
 
 with st.sidebar:
@@ -106,14 +109,15 @@ if st.button("Generate Response"):
     else:
         st.success("Image and text accepted. Preparing prompt...")
 
-        # Simple output stub until model execution is enabled
+        # Simple placeholder outputs
         stub_outputs = {
-            "caption": ["informative", "informative", "informative", "informative"],
-            "humcat": ["humanitarian", "humanitarian", "humanitarian", "humanitarian"],
-            "damage": ["mild_damage", "mild_damage", "mild_damage", "mild_damage"],
-            "localization": ["people_affected", "people_affected", "people_affected", "people_affected"]
+            "caption": ["informative"]*4,
+            "humcat": ["humanitarian"]*4,
+            "damage": ["mild_damage"]*4,
+            "localization": ["people_affected"]*4
         }
 
+        st.subheader("Model Outputs (Stub)")
         st.json(stub_outputs)
 
         user_lines = []
@@ -129,7 +133,7 @@ if st.button("Generate Response"):
         for name, outs in stub_outputs.items():
             user_lines.append("--- " + name + " ---")
             for i, out in enumerate(outs):
-                user_lines.append(f"Output {i+1}: {out}")
+                user_lines.append("Output " + str(i+1) + ": " + out)
 
         user_content = "\n".join(user_lines)
 
@@ -147,6 +151,7 @@ if st.button("Generate Response"):
                                                max_tokens=int(max_tokens),
                                                temperature=float(temperature))
                     content = response.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    st.text_area("Assistant Response:", content, height=400)
+                    st.subheader("Assistant Response")
+                    st.text_area("Response", content, height=400)
                 except Exception as e:
                     st.error("OpenRouter Error: " + str(e))
