@@ -1,8 +1,6 @@
---extra-index-url https://download.pytorch.org/whl/cpu
-
-torch==2.3.1+cpu
-torchvision==0.18.1+cpu
-torchaudio==2.3.1+cpu
+torch==2.3.1
+torchvision==0.18.1
+torchaudio==2.3.1
 
 streamlit==1.40.0
 pillow
@@ -11,4 +9,4 @@ pandas
 scikit-learn
 requests
 transformers==4.42.4
-timm
+timm==1.0.7
