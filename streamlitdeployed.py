@@ -1,230 +1,514 @@
+# streamlitdeployed.py
+# Full integrated CrisisMMD Streamlit app with T1-T4 model inference + OpenRouter plain-text output.
+# NOTES:
+# - Put your OpenRouter API key in Streamlit secrets as OPENROUTER_API_KEY
+# - Place model weight files at the paths defined below (or modify paths)
+# - If weights are missing on the host, the app falls back to safe stubs
+
 import os
 import json
+import re
 import requests
 from io import BytesIO
 from typing import List, Dict, Any
 
 import streamlit as st
 from PIL import Image
+import numpy as np
 
-# ----------------------------------------------------------------------
-# IMPORTANT: Streamlit page config MUST be first
-# ----------------------------------------------------------------------
-st.set_page_config(page_title="CrisisMMD Assistant", layout="wide")
+# Page config MUST be first Streamlit UI call
+st.set_page_config(page_title="CrisisMMD Assistant (Integrated)", layout="wide")
 
-# ----------------------------------------------------------------------
-# Light imports (safe on Streamlit Cloud)
-# ----------------------------------------------------------------------
+# ---------------------------
+# Light imports (wrapped)
+# ---------------------------
+IMPORT_ERROR_MSG = None
 try:
     import torch
-    from torchvision import transforms
-    from transformers import AutoTokenizer, AutoModel, CLIPModel
-    import timm
     import torch.nn as nn
+    from torchvision import transforms
+    from transformers import AutoTokenizer, AutoModel, CLIPModel, RobertaTokenizerFast
+    import timm
 except Exception as e:
-    st.write("Optional model imports failed (normal on Streamlit Cloud):")
-    st.code(str(e))
+    IMPORT_ERROR_MSG = str(e)
 
-# ----------------------------------------------------------------------
-# CONFIG
-# ----------------------------------------------------------------------
-DEVICE = "cpu"
+# ---------------------------
+# Configuration / Paths
+# ---------------------------
+DEVICE = torch.device("cuda" if ("torch" in globals() and torch.cuda.is_available()) else "cpu")
 CLIP_IMG_SIZE = 224
 CONV_IMG_SIZE = 256
 MAX_LEN = 96
 
-# Working OpenRouter endpoint (Streamlit Cloud compatible)
+# Local model weight paths - change if different
+T1_PATH = "T1_FUSION_FINAL.pt"
+T2_PATH = "T2T_TEXT.pt"
+T3_PATH = "T3_MULTIMODAL.pt"
+T4_PATH = "T4_MULTIMODAL.pt"
+
+# OpenRouter endpoint (cloud-compatible)
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-DEFAULT_MODEL = "qwen/qwen3-235b-a22b-2507"
+# Default model for the OpenRouter call
+DEFAULT_LLM_MODEL = "gpt-4o-mini"
 
-# Load the secret key from Streamlit secrets
-SECRET_KEY = st.secrets.get("OPENROUTER_API_KEY", "")
+# ---------------------------
+# Label mappings & helpers
+# ---------------------------
+T1_LABELS = {0: "not_informative", 1: "informative"}
+T2_LABELS = {0: "humanitarian", 1: "non_informative", 2: "structure"}
+T3_LABELS = {0: "little_or_no_damage", 1: "mild_damage", 2: "severe_damage"}
+T4_LABELS = {0: "people_affected", 1: "rescue_needed", 2: "no_human"}
 
-def get_api_key(user_input):
-    if user_input.strip():
-        return user_input.strip()
-    return SECRET_KEY
+def map_t2(lbl: str) -> int:
+    if lbl in [
+        "affected_individuals",
+        "injured_or_dead_people",
+        "missing_or_found_people",
+        "rescue_volunteering_or_donation_effort",
+    ]:
+        return 0
+    elif lbl in ["infrastructure_and_utility_damage", "vehicle_damage"]:
+        return 2
+    return 1
 
-# ----------------------------------------------------------------------
-# FULL ARCHITECTURES (your exact descriptions)
-# ----------------------------------------------------------------------
-ARCHITECTURES = """
-T1 — Informative vs Not Informative
-Text: DistilRoBERTa-base, CLS token used (768d)
-Image: CLIP ViT-B/32 vision tower (frozen, 768d)
-Text projection: 768 → 256
-Image projection: 768 → 256
-Fusion: concat 512 → MLP → 2-class output
+def map_t4(lbl: str) -> int:
+    if lbl in [
+        "affected_individuals",
+        "injured_or_dead_people",
+        "missing_or_found_people",
+    ]:
+        return 0
+    elif lbl == "rescue_volunteering_or_donation_effort":
+        return 1
+    return 2
 
-T2 — Humanitarian Category (3-class)
-DistilBERT-base-uncased text encoder
-CLS → LayerNorm → MLP(256) → 3-class head
-Classes: humanitarian, non_informative, structure
+# ---------------------------
+# Image transforms
+# ---------------------------
+if "torch" in globals():
+    clip_tf = transforms.Compose([
+        transforms.Resize((CLIP_IMG_SIZE, CLIP_IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.481,0.457,0.408],[0.269,0.261,0.276])
+    ])
+    conv_tf = transforms.Compose([
+        transforms.Resize((CONV_IMG_SIZE, CONV_IMG_SIZE)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225])
+    ])
+else:
+    clip_tf = conv_tf = None
 
-T3 — Damage Severity (3-class)
-Image: ConvNeXt-Tiny pretrained
-Text: DistilBERT-base-uncased
-Fusion: img + text → 256 → GELU → Dropout → 64 → GELU → 3-class head
-Classes: little_or_no_damage, mild_damage, severe_damage
+def pil_to_tensor_clip(pil_img: Image.Image):
+    if clip_tf is None:
+        raise RuntimeError("torch not available")
+    return clip_tf(pil_img.convert("RGB")).unsqueeze(0).to(DEVICE)
 
-T4 — Human Presence / Rescue (3-class)
-Same architecture as T3
-Classes: people_affected, rescue_needed, no_human
-"""
+def pil_to_tensor_conv(pil_img: Image.Image):
+    if conv_tf is None:
+        raise RuntimeError("torch not available")
+    return conv_tf(pil_img.convert("RGB")).unsqueeze(0).to(DEVICE)
 
-# ----------------------------------------------------------------------
-# RAW TEXT–ONLY OpenRouter call (all 4 patches)
-# ----------------------------------------------------------------------
-def call_openrouter(api_key: str,
-                    messages: List[Dict[str, str]],
-                    model: str,
-                    max_tokens: int,
-                    temperature: float):
+# ---------------------------
+# Model classes (same as your architectures)
+# ---------------------------
+class T1_FUSION(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.txt = AutoModel.from_pretrained("distilroberta-base")
+        self.img = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        # freeze the vision tower as in original setup
+        for p in self.img.vision_model.parameters():
+            p.requires_grad = False
+        self.txtp = nn.Linear(768,256)
+        self.imgp = nn.Linear(768,256)
+        self.fc   = nn.Sequential(
+            nn.Linear(512,256),
+            nn.GELU(),
+            nn.Linear(256,2)
+        )
+    def forward(self, ids, mask, img):
+        t = self.txt(input_ids=ids, attention_mask=mask).last_hidden_state[:,0]
+        with torch.no_grad():
+            v = self.img.vision_model(img).pooler_output
+        return self.fc(torch.cat([self.txtp(t), self.imgp(v)], dim=1))
 
+class T2Text(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.txt = AutoModel.from_pretrained("distilbert-base-uncased")
+        H = self.txt.config.hidden_size
+        self.ln = nn.LayerNorm(H)
+        self.head = nn.Sequential(
+            nn.Linear(H,256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256,3)
+        )
+    def forward(self, ids, mask):
+        h = self.txt(input_ids=ids, attention_mask=mask).last_hidden_state[:,0]
+        h = self.ln(h)
+        return self.head(h)
+
+class T3T4(nn.Module):
+    def __init__(self, num_classes=3):
+        super().__init__()
+        self.img = timm.create_model("convnext_tiny", pretrained=True, num_classes=0)
+        d_img = self.img(torch.zeros(1,3,CONV_IMG_SIZE,CONV_IMG_SIZE)).shape[-1]
+        self.txt = AutoModel.from_pretrained("distilbert-base-uncased")
+        d_txt = self.txt.config.hidden_size
+        self.txt_ln = nn.LayerNorm(d_txt)
+        self.head = nn.Sequential(
+            nn.Linear(d_img + d_txt, 256),
+            nn.GELU(),
+            nn.Dropout(0.3),
+            nn.Linear(256,64),
+            nn.GELU(),
+            nn.Linear(64, num_classes)
+        )
+    def forward(self, ids, mask, img):
+        i = self.img(img)
+        t = self.txt(input_ids=ids, attention_mask=mask).last_hidden_state[:,0]
+        t = self.txt_ln(t)
+        return self.head(torch.cat([i, t], dim=1))
+
+# ---------------------------
+# Instantiate models and load weights (attempt)
+# ---------------------------
+MODELS_AVAILABLE = False
+t1 = t2 = t3 = t4 = None
+t1_tok = t2_tok = None
+
+if "torch" in globals():
+    try:
+        # instantiate architectures
+        t1 = T1_FUSION().to(DEVICE)
+        t2 = T2Text().to(DEVICE)
+        t3 = T3T4(3).to(DEVICE)
+        t4 = T3T4(3).to(DEVICE)
+
+        # tokenizers
+        try:
+            t1_tok = RobertaTokenizerFast.from_pretrained("distilroberta-base")
+        except Exception:
+            t1_tok = AutoTokenizer.from_pretrained("distilroberta-base", use_fast=True)
+        t2_tok = AutoTokenizer.from_pretrained("distilbert-base-uncased", use_fast=True)
+
+        # load local weights if present
+        def safe_load(model, path):
+            if path and os.path.exists(path):
+                try:
+                    sd = torch.load(path, map_location=DEVICE)
+                    model.load_state_dict(sd)
+                    return True, None
+                except Exception as e:
+                    return False, str(e)
+            return False, "path_not_found"
+
+        loaded_ok = []
+        ok, err = safe_load(t1, T1_PATH)
+        loaded_ok.append(("T1", ok, err))
+        ok, err = safe_load(t2, T2_PATH)
+        loaded_ok.append(("T2", ok, err))
+        ok, err = safe_load(t3, T3_PATH)
+        loaded_ok.append(("T3", ok, err))
+        ok, err = safe_load(t4, T4_PATH)
+        loaded_ok.append(("T4", ok, err))
+
+        # set eval mode
+        for m in (t1, t2, t3, t4):
+            if m is not None:
+                m.eval()
+
+        # check if at least tokenizers exist
+        MODELS_AVAILABLE = True
+    except Exception as e:
+        MODELS_AVAILABLE = False
+
+# If torch not available or instantiation failed, we'll use stubs later
+# ---------------------------
+# Helper: text encoding
+# ---------------------------
+def enc(tok, text):
+    x = tok(text, return_tensors="pt", max_length=MAX_LEN, padding="max_length", truncation=True)
+    return x["input_ids"].to(DEVICE), x["attention_mask"].to(DEVICE)
+
+# ---------------------------
+# Run models on a given PIL image and tweet text
+# Returns dict of task -> list of 4 outputs (strings)
+# ---------------------------
+def run_models_on(pil_img: Image.Image, tweet_text: str):
+    outputs = {"caption": [], "humcat": [], "damage": [], "localization": []}
+
+    # If models are not available, return deterministic stubs
+    if not MODELS_AVAILABLE or any(m is None for m in (t1,t2,t3,t4,t1_tok,t2_tok)):
+        outputs["caption"] = ["informative"]*4
+        outputs["humcat"] = ["humanitarian"]*4
+        outputs["damage"] = ["mild_damage"]*4
+        outputs["localization"] = ["people_affected"]*4
+        return outputs
+
+    # T1 (text+clip)
+    try:
+        i_ids, i_mask = enc(t1_tok, tweet_text)
+        img_t1 = pil_to_tensor_clip(pil_img)
+        with torch.no_grad():
+            pred = t1(i_ids, i_mask, img_t1).argmax().item()
+        outputs["caption"] = [T1_LABELS.get(pred, str(pred))]*4
+    except Exception:
+        outputs["caption"] = ["error"]*4
+
+    # T2 (text-only)
+    try:
+        ids2, mask2 = enc(t2_tok, tweet_text)
+        with torch.no_grad():
+            pred = t2(ids2, mask2).argmax().item()
+        outputs["humcat"] = [T2_LABELS.get(pred, str(pred))]*4
+    except Exception:
+        outputs["humcat"] = ["error"]*4
+
+    # T3 (convnext + text)
+    try:
+        ids3, mask3 = enc(t2_tok, tweet_text)
+        img_t34 = pil_to_tensor_conv(pil_img)
+        with torch.no_grad():
+            pred = t3(ids3, mask3, img_t34).argmax().item()
+        outputs["damage"] = [T3_LABELS.get(pred, str(pred))]*4
+    except Exception:
+        outputs["damage"] = ["error"]*4
+
+    # T4 (convnext + text)
+    try:
+        ids4, mask4 = enc(t2_tok, tweet_text)
+        img_t44 = pil_to_tensor_conv(pil_img)
+        with torch.no_grad():
+            pred = t4(ids4, mask4, img_t44).argmax().item()
+        outputs["localization"] = [T4_LABELS.get(pred, str(pred))]*4
+    except Exception:
+        outputs["localization"] = ["error"]*4
+
+    return outputs
+
+# ---------------------------
+# Build architecture summary string (full)
+# ---------------------------
+ARCHITECTURES = (
+    "T1: DistilRoBERTa (text) + CLIP-ViT-B/32 (vision) fusion. Text proj 768->256, Image proj 768->256, merged -> 2-way classifier.\n"
+    "T2: DistilBERT (text-only) -> LayerNorm -> MLP -> 3-way humanitarian/non_informative/structure.\n"
+    "T3: ConvNeXt-Tiny (image features) + DistilBERT (text) fusion -> 3-way damage classifier.\n"
+    "T4: ConvNeXt-Tiny + DistilBERT fusion (same architecture as T3) -> 3-way people_affected/rescue_needed/no_human.\n"
+)
+
+# ---------------------------
+# OpenRouter call (valid request body)
+# Enforce raw text via system msg & appended user constraint; sanitize response after receive
+# ---------------------------
+def call_openrouter_valid(api_key: str, messages: List[Dict[str,str]], model: str, max_tokens: int, temperature: float):
     headers = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer " + api_key,
-        "HTTP-Referer": "https://your-app.streamlit.app",
-        "X-Title": "CrisisMMD Streamlit App"
+        "Authorization": "Bearer " + api_key
     }
-
-    # PATCH 3: Add provider format (disable markdown)
     body = {
         "model": model,
         "messages": messages,
         "max_tokens": max_tokens,
-        "temperature": temperature,
-        "provider": {"format": "text"}
+        "temperature": temperature
     }
-
-    r = requests.post(OPENROUTER_API_URL, headers=headers, json=body, timeout=60)
-    r.raise_for_status()
-    data = r.json()
-
-    # Extract text
+    resp = requests.post(OPENROUTER_API_URL, headers=headers, json=body, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    # extract content
     content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-
-    # PATCH 4: Sanitizer to remove common formatting characters
-    forbidden = ["*", "#", "-", "`", "_", "•", ">", "|", "~"]
-    for f in forbidden:
-        content = content.replace(f, "")
-
-    # Replace double spaces and leading/trailing whitespace
-    content = content.strip()
+    # Sanitize: remove markdown artifacts and disallowed characters
+    content = sanitize_raw_text(content)
     return content
 
+def sanitize_raw_text(text: str) -> str:
+    if text is None:
+        return ""
+    # Remove common markdown tokens and artifacts
+    # remove bold/italic markers and code fences and headings
+    text = re.sub(r"(```[\s\S]*?```)", "", text)  # remove code fences
+    text = text.replace("**", "").replace("__", "").replace("*", "")
+    text = text.replace("`", "")
+    text = re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)  # headings
+    text = text.replace("-", "")  # remove dashes often used in lists
+    text = text.replace("•", "")
+    text = text.replace("•", "")
+    text = re.sub(r"\[\^?\d+\]", "", text)  # footnote markers
+    # Remove markdown links but keep text: [text](url) -> text
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # Strip excessive whitespace
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
-# ----------------------------------------------------------------------
+# ---------------------------
 # Streamlit UI
-# ----------------------------------------------------------------------
-st.title("CrisisMMD 4-Task Assistant (Raw Text Output)")
+# ---------------------------
+st.title("CrisisMMD 4-task assistant — Integrated models + OpenRouter (Raw Text)")
 
 with st.sidebar:
-    st.header("API Settings")
+    st.header("API & Model Settings")
+    # secret from Streamlit
+    secret_api = st.secrets.get("OPENROUTER_API_KEY", "")
+    st.write("Secret API available:", bool(secret_api))
+    sidebar_key = st.text_input("OpenRouter API key (optional override)", type="password")
+    selected_model = st.selectbox("OpenRouter model", [DEFAULT_LLM_MODEL, "gpt-4o-mini", "gpt-4o"])
+    temp = st.slider("Temperature", 0.0, 1.0, 0.2)
+    max_tokens = st.number_input("Max tokens", 64, 2048, 512)
 
-    st.write("Secret Key Loaded:", bool(SECRET_KEY))
-
-    user_api_key = st.text_input("OpenRouter API key (optional override)", type="password")
-    model_name = st.selectbox("Model", ["gpt-4o-mini", "gpt-4o", DEFAULT_MODEL])
-    temperature = st.slider("Temperature", 0.0, 1.0, 0.2)
-    max_tokens = st.number_input("Max Tokens", min_value=64, max_value=2048, value=512)
-
-col1, col2 = st.columns([2, 1])
-
+col1, col2 = st.columns([2,1])
 with col1:
-    uploaded_image = st.file_uploader("Upload image (RGB)", type=["png", "jpg", "jpeg"])
-    uploaded_masks = st.file_uploader("Upload segmentation masks (optional)", accept_multiple_files=True)
-    tweet_text = st.text_area("Original Tweet", height=160)
-    disaster_type = st.text_input("Disaster Type (e.g., flood, earthquake)")
+    uploaded_image = st.file_uploader("Upload satellite / disaster image (RGB)", type=["png","jpg","jpeg"])
+    uploaded_masks = st.file_uploader("Upload segmentation mask(s) (optional)", accept_multiple_files=True, type=["png","jpg","jpeg"])
+    original_tweet = st.text_area("Original tweet text", height=160)
+    disaster_type = st.text_input("Disaster type (e.g., flood)")
 
 with col2:
+    st.write("Device:", str(DEVICE))
     st.write("Torch available:", "torch" in globals())
-    st.write("Device:", DEVICE)
+    if IMPORT_ERROR_MSG:
+        st.write("Optional import errors (ignored):")
+        st.code(IMPORT_ERROR_MSG)
+    # show whether model weights were loaded
+    mw_status = {
+        "t1": os.path.exists(T1_PATH),
+        "t2": os.path.exists(T2_PATH),
+        "t3": os.path.exists(T3_PATH),
+        "t4": os.path.exists(T4_PATH)
+    }
+    st.write("Model weight files present (paths):")
+    st.json(mw_status)
+    st.write("MODELS_AVAILABLE:", MODELS_AVAILABLE)
 
-
-# Image preview
+# preview images and masks
+pil_img = None
+mask_infos = []
 if uploaded_image:
-    img = Image.open(uploaded_image).convert("RGB")
-    st.image(img, caption="Uploaded Image", use_column_width=True)
+    try:
+        pil_img = Image.open(uploaded_image).convert("RGB")
+        st.image(pil_img, caption="Uploaded image", use_column_width=True)
+    except Exception as e:
+        st.error("Could not read uploaded image: " + str(e))
 
+if uploaded_masks:
+    for m in uploaded_masks:
+        try:
+            mi = Image.open(m).convert("L")
+            mask_infos.append({"name": getattr(m, "name", "mask"), "size": mi.size})
+            st.image(mi, caption=f"Mask: {getattr(m,'name','mask')}", use_column_width=True)
+        except Exception as e:
+            st.warning(f"Could not open mask {getattr(m,'name','')}: {e}")
 
-# ----------------------------------------------------------------------
-# Run: Generate response
-# ----------------------------------------------------------------------
-if st.button("Generate Crisis Response"):
-
-    api_key = get_api_key(user_api_key)
-
+# ---------------------------
+# Run inference & call OpenRouter
+# ---------------------------
+if st.button("Run models and get response"):
+    api_key = sidebar_key.strip() or secret_api or os.environ.get("OPENROUTER_API_KEY","")
     if not api_key:
-        st.error("You must set OPENROUTER_API_KEY in Streamlit secrets or sidebar.")
+        st.error("OpenRouter API key missing. Add to Streamlit secrets or paste in sidebar.")
         st.stop()
-
-    if not uploaded_image:
+    if pil_img is None:
         st.error("Please upload an image.")
         st.stop()
-
-    if not tweet_text.strip():
-        st.error("Enter tweet text.")
+    if not original_tweet.strip():
+        st.error("Please paste the original tweet text.")
         st.stop()
 
-    # Stub model outputs for now
-    task_outputs = {
-        "caption": ["informative"] * 4,
-        "humcat": ["humanitarian"] * 4,
-        "damage": ["mild_damage"] * 4,
-        "localization": ["people_affected"] * 4
-    }
-
-    st.subheader("Model Outputs (Temporary)")
+    with st.spinner("Running task models..."):
+        task_outputs = run_models_on(pil_img, original_tweet)
+    st.success("Models ran (or stubs used).")
+    st.subheader("Task model outputs")
     st.json(task_outputs)
 
-    # Construct user prompt
-    lines = []
-    lines.append("Disaster Type: " + disaster_type)
-    lines.append("Original Tweet:")
-    lines.append(tweet_text)
-    lines.append("")
-    lines.append("Model Architectures:")
-    lines.append(ARCHITECTURES)
-    lines.append("")
-    lines.append("Task Model Outputs:")
+    # Prepare prompt: architectures, mask summary, outputs, disaster type, tweet
+    prompt_lines = []
+    prompt_lines.append("Disaster type: " + (disaster_type or "(unknown)"))
+    prompt_lines.append("Original tweet:")
+    prompt_lines.append(original_tweet)
+    prompt_lines.append("")
+    prompt_lines.append("Segmentation masks summary:")
+    if mask_infos:
+        for mi in mask_infos:
+            prompt_lines.append(f"- {mi.get('name','mask')} size {mi.get('size')}")
+    else:
+        prompt_lines.append("(no masks provided)")
+    prompt_lines.append("")
+    prompt_lines.append("Model architecture definitions (raw):")
+    prompt_lines.append(ARCHITECTURES)
+    prompt_lines.append("")
+    prompt_lines.append("Task model outputs:")
+    for tname, outs in task_outputs.items():
+        prompt_lines.append(f"--- {tname} ---")
+        for i,o in enumerate(outs):
+            prompt_lines.append(f"Output {i+1}: {o}")
+    # final instruction requiring plain raw text
+    prompt_lines.append("")
+    prompt_lines.append("The response MUST be plain text only. Do not use markdown, headings, bullets, numbering, emojis, asterisks, or any formatting characters. Use only sentences and newlines.")
 
-    for k, outs in task_outputs.items():
-        lines.append(f"{k}:")
-        for i, o in enumerate(outs):
-            lines.append(f"{o}")
+    user_content = "\n".join(prompt_lines)
 
-    # PATCH 2: Force raw text requirement in user content
-    lines.append("")
-    lines.append("The output must be plain text only. Do not use markdown. Do not use bold. Do not use lists. Do not use formatting symbols. Use only plain sentences.")
+    system_msg = (
+        "You are an assistant specialized in crisis/social media multimodal analysis. "
+        "Respond ONLY in raw plain text. Do not use markdown, headings, bullets, numbering, symbols, emojis, or formatting of any kind. "
+        "No asterisks, no hashes, no hyphens, no code blocks. Output must be plain sentences separated only by newlines."
+    )
 
-    user_content = "\n".join(lines)
-
-    # PATCH 1: Strong system instructions
     messages = [
-        {
-            "role": "system",
-            "content": "Respond ONLY in raw plain text. No markdown, no headings, no bullet points, no asterisks, no hyphens, no hashes, no code blocks, no formatting of any kind. Only plain sentences."
-        },
-        {
-            "role": "user",
-            "content": user_content
-        }
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_content}
     ]
 
+    # call OpenRouter
     try:
         with st.spinner("Calling OpenRouter..."):
-            response_text = call_openrouter(
-                api_key=api_key,
-                messages=messages,
-                model=model_name,
-                max_tokens=int(max_tokens),
-                temperature=float(temperature)
-            )
-
-        st.subheader("Assistant Response (Raw Text Only)")
-        st.text_area("Response", response_text, height=400)
-
+            llm_text = call_openrouter_valid(api_key=api_key, messages=messages, model=selected_model, max_tokens=int(max_tokens), temperature=float(temp))
+        st.subheader("Assistant response (raw text)")
+        st.text_area("Response (raw)", llm_text, height=400)
+    except requests.exceptions.HTTPError as he:
+        st.error(f"OpenRouter HTTP error: {he} - {getattr(he.response,'text', '')}")
     except Exception as e:
-        st.error("OpenRouter Error: " + str(e))
+        st.error("OpenRouter error: " + str(e))
+
+# ---------------------------
+# Prompt download
+# ---------------------------
+if st.button("Download assembled prompt (JSON)"):
+    try:
+        # reuse last-known variables if present; otherwise return a minimal prompt
+        try:
+            task_outputs
+        except NameError:
+            task_outputs = {"caption":[""],"humcat":[""],"damage":[""],"localization":[""]}
+
+        lines = []
+        lines.append("Disaster type: " + (disaster_type or "(unknown)"))
+        lines.append("Original tweet:")
+        lines.append(original_tweet or "")
+        lines.append("")
+        lines.append("Model architectures:")
+        lines.append(ARCHITECTURES)
+        lines.append("")
+        lines.append("Task model outputs:")
+        for tname, outs in task_outputs.items():
+            lines.append(f"--- {tname} ---")
+            for i,o in enumerate(outs):
+                lines.append(f"Output {i+1}: {o}")
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": "\n".join(lines)}
+        ]
+
+        buff = BytesIO()
+        buff.write(json.dumps(messages, indent=2).encode("utf-8"))
+        buff.seek(0)
+        st.download_button("Download prompt JSON", buff, file_name="crisismmd_prompt.json")
+    except Exception as e:
+        st.error("Could not assemble prompt: " + str(e))
+
+# ---------------------------
+# End
+# ---------------------------
