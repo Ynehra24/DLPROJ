@@ -261,6 +261,38 @@ python final_segmentandtweet_pipeline.py \
   <img src="https://github.com/Ynehra24/DLPROJ/blob/main/o3.jpeg" width="900">
 </p>
 
+## Some sample outputs for the CrisisMMD model - 
+📝 Tweet ID 911619664597405697: Hurricane Maria Recovery: OECS Moves Beyond Climate Change to Climate Reality https://t.co/OccF3UHWFM https://t.co/KdYlq0le7X
+T1 Pred: 1 | True: 1 T2 Pred: 1 | True: 2 T3 Pred: 1 | True: 2 T4 Pred: 1 | True: 2
+
+📝 Tweet ID 904925838839169028: Remnants of Harvey Spawn Tornadoes, Floods Across Deep South https://t.co/PqQ24484HC https://t.co/FpaT5Goyvw
+T1 Pred: 1 | True: 1 T2 Pred: 1 | True: 2 T3 Pred: 1 | True: 0 T4 Pred: 1 | True: 2
+
+📝 Tweet ID 910160788849008640: Pearl Fincher Museum continues post-Harvey cleanup efforts https://t.co/XtB919dtLW https://t.co/TBNZNBMPup
+T1 Pred: 1 | True: 1 T2 Pred: 1 | True: 2 T3 Pred: 1 | True: 1 T4 Pred: 1 | True: 2
+
+📝 Tweet ID 929989658351505408: RT @HuffPost: Hundreds dead after powerful #earthquake hits border between Iran and Iraq https://t.co/p8TJjvjOhr https://t.co/l4PJqZxiaz
+T1 Pred: 1 | True: 1 T2 Pred: 1 | True: 2 T3 Pred: 1 | True: 2 T4 Pred: 1 | True: 0
+
+📝 Tweet ID 910225493877813249: Work ongoing to repair damage to #edistobeach post Irma. Lots of sand, barriers out of place @ABCNews4 #chstrfc #chs https://t.co/6hNdGGgQPg
+T1 Pred: 1 | True: 1 T2 Pred: 1 | True: 2 T3 Pred: 1 | True: 0 T4 Pred: 1 | True: 1
+
+📝 Tweet ID 912077714227593216: RT @TreyYingst: New satellite images show widespread destruction in St. Croix after Hurricane Maria https://t.co/qTrQXHNxMQ
+T1 Pred: 1 | True: 1 T2 Pred: 1 | True: 2 T3 Pred: 1 | True: 1 T4 Pred: 1 | True: 2
+
+📝 Tweet ID 908406994461224960: Leftists to the Rescue: Where the State and Big NGOs Fail, Mutual Aid Networks Step In https://t.co/XJa3ScAjx7 https://t.co/oHGm55SwPf
+T1 Pred: 1 | True: 1 T2 Pred: 1 | True: 1 T3 Pred: 1 | True: 2 T4 Pred: 1 | True: 2
+
+📝 Tweet ID 930010119332679682: #BreakingNews Death toll from 7.3-magnitude #earthquake at #Iran #Iraq border now stands at 330 #Kurdistan https://t.co/vSF8LAEZQo
+T1 Pred: 1 | True: 1 T2 Pred: 1 | True: 2 T3 Pred: 1 | True: 2 T4 Pred: 1 | True: 0
+
+==================== FINAL SCORES ====================
+T1: 0.95
+T2: 0.52
+T3: 0.86
+T4: 0.99
+======================================================
+
 ## 📌 Key Learnings
 
 * **Multimodal > Single-Modality**
