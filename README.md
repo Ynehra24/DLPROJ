@@ -256,6 +256,9 @@ python final_segmentandtweet_pipeline.py \
 ## Our Output - 
 <p align="center">
   <img src="https://github.com/Ynehra24/DLPROJ/blob/main/pngimage.png" width="900">
+  <img src="https://github.com/Ynehra24/DLPROJ/blob/main/o1.jpeg" width="900">
+  <img src="https://github.com/Ynehra24/DLPROJ/blob/main/o2.jpeg" width="900">
+  <img src="https://github.com/Ynehra24/DLPROJ/blob/main/o3.jpeg" width="900">
 </p>
 
 ## 📌 Key Learnings
