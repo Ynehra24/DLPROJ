@@ -23,17 +23,18 @@ import timm
 import torch.nn as nn
 
 # ------------------ User paths / config ------------------
-IMAGE_ROOT = "/Users/yatharthnehva/Desktop/CrisisMMD_v2.0/data_image"
-T1_FILE = "/Users/yatharthnehva/Desktop/CrisisMMD_v2.0/crisismmd_datasplit_all/task_informative_text_img_train.tsv"
-T2_FILE = "/Users/yatharthnehva/Desktop/CrisisMMD_v2.0/crisismmd_datasplit_all/task_humanitarian_text_img_train.tsv"
-T3_FILE = "/Users/yatharthnehva/Desktop/CrisisMMD_v2.0/crisismmd_datasplit_all/task_damage_text_img_train.tsv"
+# NOTE: These paths are only used locally. On Streamlit Cloud they are ignored safely.
+IMAGE_ROOT = "/tmp"
+T1_FILE = "/tmp/t1.tsv"
+T2_FILE = "/tmp/t2.tsv"
+T3_FILE = "/tmp/t3.tsv"
 
-T1_PATH = "/Users/yatharthnehva/Desktop/ALL_MODELS/T1_FUSION_FINAL.pt"
-T2_PATH = "/Users/yatharthnehva/Desktop/ALL_MODELS/T2T_TEXT.pt"
-T3_PATH = "/Users/yatharthnehva/Desktop/ALL_MODELS/T3_MULTIMODAL.pt"
-T4_PATH = "/Users/yatharthnehva/Desktop/ALL_MODELS/T4_MULTIMODAL.pt"
+T1_PATH = "T1_FUSION_FINAL.pt"
+T2_PATH = "T2T_TEXT.pt"
+T3_PATH = "T3_MULTIMODAL.pt"
+T4_PATH = "T4_MULTIMODAL.pt"
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DEVICE = torch.device("cpu")
 CLIP_IMG_SIZE = 224
 CONV_IMG_SIZE = 256
 MAX_LEN = 96
@@ -41,7 +42,6 @@ MAX_LEN = 96
 OPENROUTER_API_URL = "https://api.openrouter.ai/v1/chat/completions"
 DEFAULT_MODEL = "gpt-4o-mini"
 
-# ------------------ Utility functions ------------------
 def call_openrouter(api_key: str, prompt_messages: List[Dict[str, str]],
                     model: str = DEFAULT_MODEL, max_tokens: int = 512,
                     temperature: float = 0.2) -> Dict[str, Any]:
@@ -58,31 +58,34 @@ def call_openrouter(api_key: str, prompt_messages: List[Dict[str, str]],
     res.raise_for_status()
     return res.json()
 
-print("🟢 DEVICE:", DEVICE)
+print("DEVICE:", DEVICE)
 
-# ------------------ Try loading sample dataset ------------------
+# ------------------ Safe dataset load ------------------
 try:
-    T1 = pd.read_csv(T1_FILE, sep="\t")
-    T2 = pd.read_csv(T2_FILE, sep="\t")
-    T3 = pd.read_csv(T3_FILE, sep="\t")
+    if os.path.exists(T1_FILE):
+        T1 = pd.read_csv(T1_FILE, sep="\t")
+        T2 = pd.read_csv(T2_FILE, sep="\t")
+        T3 = pd.read_csv(T3_FILE, sep="\t")
 
-    eval_df = (
-        T1[["tweet_id","tweet_text","image","label"]].rename(columns={"label":"t1_label"})
-        .merge(
-            T2[["tweet_id","tweet_text","image","label","label_text","label_text_image"]],
-            on=["tweet_id","tweet_text","image"]
-        )
-        .merge(
-            T3[["tweet_id","tweet_text","image","label"]].rename(columns={"label":"t3_label"}),
-            on=["tweet_id","tweet_text","image"]
-        )
-    ).sample(10).reset_index(drop=True)
+        eval_df = (
+            T1[["tweet_id","tweet_text","image","label"]].rename(columns={"label":"t1_label"})
+            .merge(
+                T2[["tweet_id","tweet_text","image","label","label_text","label_text_image"]],
+                on=["tweet_id","tweet_text","image"]
+            )
+            .merge(
+                T3[["tweet_id","tweet_text","image","label"]].rename(columns={"label":"t3_label"}),
+                on=["tweet_id","tweet_text","image"]
+            )
+        ).sample(5).reset_index(drop=True)
 
-    print(f"\n🔹 Loaded {len(eval_df)} aligned multimodal samples\n")
-
+        print("Loaded local dataset with", len(eval_df), "rows")
+    else:
+        eval_df = None
+        print("No local dataset found; continuing without it.")
 except Exception as e:
-    print("Could not load local dataset, continuing. Error:", e)
     eval_df = None
+    print("Dataset load error:", e)
 
 # ------------------ Label mappers ------------------
 T1_MAP = {"informative":1,"not_informative":0}
@@ -96,18 +99,16 @@ def map_t2(lbl: str) -> int:
     ]: return 0
     elif lbl in ["infrastructure_and_utility_damage", "vehicle_damage"]:
         return 2
-    else:
-        return 1
+    return 1
 
 T3_MAP = {"little_or_no_damage":0,"mild_damage":1,"severe_damage":2}
 
 def map_t4(lbl: str) -> int:
     if lbl in ["affected_individuals","injured_or_dead_people","missing_or_found_people"]:
         return 0
-    elif lbl == "rescue_volunteering_or_donation_effort":
+    if lbl == "rescue_volunteering_or_donation_effort":
         return 1
-    else:
-        return 2
+    return 2
 
 # ------------------ Image transforms ------------------
 clip_tf = transforms.Compose([
@@ -124,8 +125,13 @@ conv_tf = transforms.Compose([
 
 # ------------------ Text encoding ------------------
 def enc(tok,text):
-    x = tok(text, return_tensors="pt", max_length=MAX_LEN,
-            padding="max_length", truncation=True)
+    x = tok(
+        text,
+        return_tensors="pt",
+        max_length=MAX_LEN,
+        padding="max_length",
+        truncation=True
+    )
     return x["input_ids"].to(DEVICE), x["attention_mask"].to(DEVICE)
 
 # ------------------ Model classes ------------------
@@ -139,14 +145,16 @@ class T1_FUSION(nn.Module):
         self.txtp = nn.Linear(768,256)
         self.imgp = nn.Linear(768,256)
         self.fc   = nn.Sequential(
-            nn.Linear(512,256), nn.GELU(), nn.Linear(256,2)
+            nn.Linear(512,256),
+            nn.GELU(),
+            nn.Linear(256,2)
         )
 
     def forward(self,ids,mask,img):
         t = self.txt(input_ids=ids,attention_mask=mask).last_hidden_state[:,0]
         with torch.no_grad():
             v = self.img.vision_model(img).pooler_output
-        return self.fc(torch.cat([self.txtp(t), self.imgp(v)],1))
+        return self.fc(torch.cat([self.txtp(t), self.imgp(v)], dim=1))
 
 class T2Text(nn.Module):
     def __init__(self):
@@ -186,36 +194,27 @@ class T3T4(nn.Module):
         i = self.img(img)
         t = self.txt(input_ids=ids,attention_mask=mask).last_hidden_state[:,0]
         t = self.txt_ln(t)
-        return self.head(torch.cat([i,t],1))
+        return self.head(torch.cat([i,t], dim=1))
 
 # ------------------ Load models ------------------
-LOAD_LOCAL_MODELS = True
+LOAD_LOCAL_MODELS = False  # disable weight loading on cloud
 
 try:
     t1 = T1_FUSION().to(DEVICE)
-    if LOAD_LOCAL_MODELS and os.path.exists(T1_PATH):
-        t1.load_state_dict(torch.load(T1_PATH,map_location=DEVICE))
-    t1.eval()
-    t1_tok = RobertaTokenizerFast.from_pretrained("distilroberta-base")
-
     t2 = T2Text().to(DEVICE)
-    if LOAD_LOCAL_MODELS and os.path.exists(T2_PATH):
-        t2.load_state_dict(torch.load(T2_PATH,map_location=DEVICE))
-    t2.eval()
-    t2_tok = AutoTokenizer.from_pretrained("distilbert-base-uncased")
-
     t3 = T3T4(3).to(DEVICE)
-    if LOAD_LOCAL_MODELS and os.path.exists(T3_PATH):
-        t3.load_state_dict(torch.load(T3_PATH,map_location=DEVICE))
-    t3.eval()
-
     t4 = T3T4(3).to(DEVICE)
-    if LOAD_LOCAL_MODELS and os.path.exists(T4_PATH):
-        t4.load_state_dict(torch.load(T4_PATH,map_location=DEVICE))
+
+    t1.eval()
+    t2.eval()
+    t3.eval()
     t4.eval()
 
+    t1_tok = RobertaTokenizerFast.from_pretrained("distilroberta-base")
+    t2_tok = AutoTokenizer.from_pretrained("distilbert-base-uncased")
+
 except Exception as e:
-    print("Warning: could not load all models:", e)
+    print("Model init error:", e)
     t1 = t2 = t3 = t4 = None
 
 # ------------------ Image conversion ------------------
@@ -235,53 +234,53 @@ def run_models_on(pil_img: Image.Image, tweet_text: str) -> Dict[str, List[str]]
 
     outputs = {"caption": [], "damage": [], "humcat": [], "localization": []}
 
-    # T1
     try:
         ids,mask = enc(t1_tok,tweet_text)
         img_t1 = pil_to_tensor_clip(pil_img)
         p = t1(ids,mask,img_t1).argmax().item()
         outputs["caption"] = [T1_LABELS[p]]*4
-    except: outputs["caption"] = ["error"]*4
+    except:
+        outputs["caption"] = ["error"]*4
 
-    # T2
     try:
         ids,mask = enc(t2_tok,tweet_text)
         p = t2(ids,mask).argmax().item()
         outputs["humcat"] = [T2_LABELS[p]]*4
-    except: outputs["humcat"] = ["error"]*4
+    except:
+        outputs["humcat"] = ["error"]*4
 
-    # T3
     try:
         ids,mask = enc(t2_tok,tweet_text)
         img_t34 = pil_to_tensor_conv(pil_img)
         p = t3(ids,mask,img_t34).argmax().item()
         outputs["damage"] = [T3_LABELS[p]]*4
-    except: outputs["damage"] = ["error"]*4
+    except:
+        outputs["damage"] = ["error"]*4
 
-    # T4
     try:
         ids,mask = enc(t2_tok,tweet_text)
         img_t34 = pil_to_tensor_conv(pil_img)
         p = t4(ids,mask,img_t34).argmax().item()
         outputs["localization"] = [T4_LABELS[p]]*4
-    except: outputs["localization"] = ["error"]*4
+    except:
+        outputs["localization"] = ["error"]*4
 
     return outputs
 
 # ------------------ Architecture summary ------------------
 ARCHITECTURES = """
-T1: DistilRoBERTa + CLIP-ViT-B/32 fusion → 2-way informative classifier.
-T2: DistilBERT text-only → 3-way humanitarian/non_informative/structure.
-T3: ConvNeXt-Tiny image + DistilBERT text fusion → 3-way damage classification.
-T4: ConvNeXt-Tiny + DistilBERT fusion → 3-way human rescue/people/no_human.
+T1: DistilRoBERTa + CLIP-ViT-B/32 fusion => 2-class (informative).
+T2: DistilBERT => 3-class (humanitarian).
+T3: ConvNeXt-Tiny + DistilBERT => 3-class (damage).
+T4: ConvNeXt-Tiny + DistilBERT => 3-class (human presence).
 """
 
 # ------------------ Streamlit UI ------------------
 st.set_page_config(page_title="CrisisMMD Assistant", layout="wide")
-st.title("CrisisMMD 4-task assistant — models run on uploaded image + tweet")
+st.title("CrisisMMD 4-task assistant (image + tweet)")
 
 with st.sidebar:
-    st.header("API & Settings")
+    st.header("API Settings")
     api_key_input = st.text_input("OpenRouter API key", type="password")
     api_key = api_key_input or os.environ.get("OPENROUTER_API_KEY","")
     model_name = st.selectbox("Model", ["gpt-4o-mini","gpt-4o"], index=0)
@@ -290,117 +289,100 @@ with st.sidebar:
 
 col1, col2 = st.columns([2,1])
 with col1:
-    uploaded_image = st.file_uploader("Upload satellite image/photo (RGB)", type=["png","jpg","jpeg"])
-    uploaded_masks = st.file_uploader("Upload optional segmentation masks", accept_multiple_files=True, type=["png","jpg","jpeg"])
-    original_tweet = st.text_area("Original tweet", height=160)
-    disaster_type = st.text_input("Disaster type (e.g., flood)")
+    uploaded_image = st.file_uploader("Upload image", type=["png","jpg","jpeg"])
+    uploaded_masks = st.file_uploader("Upload masks (optional)", accept_multiple_files=True, type=["png","jpg","jpeg"])
+    original_tweet = st.text_area("Tweet text", height=160)
+    disaster_type = st.text_input("Disaster type")
 
 with col2:
     st.write("Device:", DEVICE)
-    st.write("T1 Loaded:", t1 is not None)
-    st.write("T2 Loaded:", t2 is not None)
-    st.write("T3 Loaded:", t3 is not None)
-    st.write("T4 Loaded:", t4 is not None)
 
-# ------------------ Image preview ------------------
+# Preview image
 if uploaded_image:
     pil_img = Image.open(uploaded_image).convert("RGB")
     st.image(pil_img, caption="Uploaded Image", use_column_width=True)
 
-# ------------------ RUN MODELS + CALL OPENROUTER ------------------
+# RUN MODELS
 if st.button("Run models and generate response"):
     if not uploaded_image:
-        st.error("Upload an image first.")
+        st.error("Upload an image.")
     elif not original_tweet.strip():
-        st.error("Enter tweet text.")
+        st.error("Enter the tweet.")
     else:
         with st.spinner("Running models..."):
             task_outputs = run_models_on(pil_img, original_tweet)
             st.subheader("Model Outputs")
             st.json(task_outputs)
 
-        user_lines = []
-        user_lines.append(f"Disaster type: {disaster_type}")
-        user_lines.append("Original tweet:")
-        user_lines.append(original_tweet)
-        user_lines.append("")
-        user_lines.append("Model architectures:")
-        user_lines.append(ARCHITECTURES)
-        user_lines.append("")
-        user_lines.append("Task model outputs:")
+        # Build user prompt
+        user_lines = [
+            "Disaster type: " + str(disaster_type),
+            "Original tweet:",
+            original_tweet,
+            "",
+            "Model architectures:",
+            ARCHITECTURES,
+            "",
+            "Task model outputs:"
+        ]
 
-        for t, outs in task_outputs.items():
-            user_lines.append(f"--- {t} ---")
-            for i,o in enumerate(outs):
+        for tname, outs in task_outputs.items():
+            user_lines.append("--- " + tname + " ---")
+            for i, o in enumerate(outs):
                 user_lines.append(f"Output {i+1}: {o}")
 
         user_content = "\n".join(user_lines)
 
         messages = [
-            {"role":"system","content":"You are a crisis-response assistant. Produce structured, compassionate, actionable insights."},
+            {"role":"system","content":"Crisis-response assistant. Provide actionable insights."},
             {"role":"user","content":user_content}
         ]
 
         if not api_key:
-            st.error("Missing OpenRouter API key.")
+            st.error("Missing API key.")
         else:
             with st.spinner("Calling OpenRouter..."):
-                res = call_openrouter(api_key, messages, model=model_name, max_tokens=int(max_tokens), temperature=float(temperature))
+                res = call_openrouter(api_key, messages, model=model_name,
+                                      max_tokens=int(max_tokens), temperature=float(temperature))
 
                 content = res.get("choices",[{}])[0].get("message",{}).get("content","")
                 st.subheader("Assistant Response")
                 st.text_area("Response", content, height=400)
 
-            # Optional structured JSON
-            if st.checkbox("Request structured JSON output"):
-                fu = [
-                    {"role":"system","content":"Return ONLY valid JSON."},
-                    {"role":"user","content":"Return JSON with: summary, suggested_hashtags[], short_reply, instructions_for_public, metadata{}."}
-                ]
-                fu_res = call_openrouter(api_key, messages+fu, model=model_name, max_tokens=512, temperature=0.0)
-
-                try:
-                    fu_content = fu_res["choices"][0]["message"]["content"]
-                    st.json(json.loads(fu_content))
-                except:
-                    st.text_area("Raw JSON response", json.dumps(fu_res,indent=2))
-
-# ------------------ Download prompt ------------------
-if st.button("Download assembled prompt JSON"):
+# Download prompt
+if st.button("Download prompt JSON"):
     try:
-        user_lines = []
-        user_lines.append(f"Disaster type: {disaster_type}")
-        user_lines.append("Original tweet:")
-        user_lines.append(original_tweet)
-        user_lines.append("")
-        user_lines.append("Model architecture definitions:")
-        user_lines.append(ARCHITECTURES)
-        user_lines.append("")
+        try:
+            task_outputs
+        except:
+            task_outputs = {"caption":[""],"damage":[""],"humcat":[""],"localization":[""]}
 
-        try: task_outputs
-        except: task_outputs = {"caption":[""],"damage":[""],"humcat":[""],"localization":[""]}
+        user_lines = [
+            "Disaster type: " + str(disaster_type),
+            "Original tweet:",
+            original_tweet,
+            "",
+            "Model architectures:",
+            ARCHITECTURES,
+            "",
+            "Task model outputs:"
+        ]
 
-        user_lines.append("Task model outputs:")
-        for t, outs in task_outputs.items():
-            user_lines.append(f"--- {t} ---")
+        for tname, outs in task_outputs.items():
+            user_lines.append("--- " + tname + " ---")
             for i,o in enumerate(outs):
                 user_lines.append(f"Output {i+1}: {o}")
 
         messages = [
             {"role":"system","content":"Crisis-response assistant."},
-            {"role":"user","content":"\n".join(user_lines)}
+            {"role":"user","content": "\n".join(user_lines) }
         ]
 
         buff = BytesIO()
         buff.write(json.dumps(messages, indent=2).encode())
         buff.seek(0)
-
         st.download_button("Download JSON", buff, file_name="crisismmd_prompt.json")
 
     except Exception as e:
-        st.error(f"Failed: {e}")
-
-# ------------------ System helper ------------------
-def system_msg_short():
-    return "Crisis response assistant. Return brief, factual, compassionate outputs."
+        st.error("Error: " + str(e))
 
