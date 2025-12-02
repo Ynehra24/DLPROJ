@@ -23,19 +23,29 @@ st.set_page_config(page_title="CrisisMMD Assistant (Integrated)", layout="wide")
 # Light imports (wrapped)
 # ---------------------------
 IMPORT_ERROR_MSG = None
+# try to import heavy libs but do NOT call streamlit functions here
 try:
     import torch
     import torch.nn as nn
     from torchvision import transforms
-    from transformers import AutoTokenizer, AutoModel, CLIPModel, RobertaTokenizerFast
+    # RobertaTokenizerFast might not exist in some transformer builds; we'll fallback later
+    try:
+        from transformers import AutoTokenizer, AutoModel, CLIPModel, RobertaTokenizerFast
+    except Exception:
+        from transformers import AutoTokenizer, AutoModel, CLIPModel
+        RobertaTokenizerFast = None
     import timm
 except Exception as e:
     IMPORT_ERROR_MSG = str(e)
 
 # ---------------------------
-# Configuration / Paths
+# Safe DEVICE selection (do not reference torch if not present)
 # ---------------------------
-DEVICE = torch.device("cuda" if ("torch" in globals() and torch.cuda.is_available()) else "cpu")
+if "torch" in globals():
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+else:
+    DEVICE = "cpu"
+
 CLIP_IMG_SIZE = 224
 CONV_IMG_SIZE = 256
 MAX_LEN = 96
@@ -49,8 +59,8 @@ T4_PATH = "T4_MULTIMODAL.pt"
 # OpenRouter endpoint (cloud-compatible)
 OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# Default model for the OpenRouter call
-DEFAULT_LLM_MODEL = "gpt-4o-mini"
+# Default model for the OpenRouter call - changed to Qwen per request
+DEFAULT_LLM_MODEL = "qwen/qwen3-32b"
 
 # ---------------------------
 # Label mappings & helpers
@@ -84,7 +94,7 @@ def map_t4(lbl: str) -> int:
     return 2
 
 # ---------------------------
-# Image transforms
+# Image transforms (only if torch available)
 # ---------------------------
 if "torch" in globals():
     clip_tf = transforms.Compose([
@@ -113,65 +123,71 @@ def pil_to_tensor_conv(pil_img: Image.Image):
 # ---------------------------
 # Model classes (same as your architectures)
 # ---------------------------
-class T1_FUSION(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.txt = AutoModel.from_pretrained("distilroberta-base")
-        self.img = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        # freeze the vision tower as in original setup
-        for p in self.img.vision_model.parameters():
-            p.requires_grad = False
-        self.txtp = nn.Linear(768,256)
-        self.imgp = nn.Linear(768,256)
-        self.fc   = nn.Sequential(
-            nn.Linear(512,256),
-            nn.GELU(),
-            nn.Linear(256,2)
-        )
-    def forward(self, ids, mask, img):
-        t = self.txt(input_ids=ids, attention_mask=mask).last_hidden_state[:,0]
-        with torch.no_grad():
-            v = self.img.vision_model(img).pooler_output
-        return self.fc(torch.cat([self.txtp(t), self.imgp(v)], dim=1))
+if "torch" in globals():
+    class T1_FUSION(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.txt = AutoModel.from_pretrained("distilroberta-base")
+            self.img = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+            # freeze the vision tower as in original setup
+            for p in self.img.vision_model.parameters():
+                p.requires_grad = False
+            self.txtp = nn.Linear(768,256)
+            self.imgp = nn.Linear(768,256)
+            self.fc   = nn.Sequential(
+                nn.Linear(512,256),
+                nn.GELU(),
+                nn.Linear(256,2)
+            )
+        def forward(self, ids, mask, img):
+            t = self.txt(input_ids=ids, attention_mask=mask).last_hidden_state[:,0]
+            with torch.no_grad():
+                v = self.img.vision_model(img).pooler_output
+            return self.fc(torch.cat([self.txtp(t), self.imgp(v)], dim=1))
 
-class T2Text(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.txt = AutoModel.from_pretrained("distilbert-base-uncased")
-        H = self.txt.config.hidden_size
-        self.ln = nn.LayerNorm(H)
-        self.head = nn.Sequential(
-            nn.Linear(H,256),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(256,3)
-        )
-    def forward(self, ids, mask):
-        h = self.txt(input_ids=ids, attention_mask=mask).last_hidden_state[:,0]
-        h = self.ln(h)
-        return self.head(h)
+    class T2Text(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.txt = AutoModel.from_pretrained("distilbert-base-uncased")
+            H = self.txt.config.hidden_size
+            self.ln = nn.LayerNorm(H)
+            self.head = nn.Sequential(
+                nn.Linear(H,256),
+                nn.GELU(),
+                nn.Dropout(0.3),
+                nn.Linear(256,3)
+            )
+        def forward(self, ids, mask):
+            h = self.txt(input_ids=ids, attention_mask=mask).last_hidden_state[:,0]
+            h = self.ln(h)
+            return self.head(h)
 
-class T3T4(nn.Module):
-    def __init__(self, num_classes=3):
-        super().__init__()
-        self.img = timm.create_model("convnext_tiny", pretrained=True, num_classes=0)
-        d_img = self.img(torch.zeros(1,3,CONV_IMG_SIZE,CONV_IMG_SIZE)).shape[-1]
-        self.txt = AutoModel.from_pretrained("distilbert-base-uncased")
-        d_txt = self.txt.config.hidden_size
-        self.txt_ln = nn.LayerNorm(d_txt)
-        self.head = nn.Sequential(
-            nn.Linear(d_img + d_txt, 256),
-            nn.GELU(),
-            nn.Dropout(0.3),
-            nn.Linear(256,64),
-            nn.GELU(),
-            nn.Linear(64, num_classes)
-        )
-    def forward(self, ids, mask, img):
-        i = self.img(img)
-        t = self.txt(input_ids=ids, attention_mask=mask).last_hidden_state[:,0]
-        t = self.txt_ln(t)
-        return self.head(torch.cat([i, t], dim=1))
+    class T3T4(nn.Module):
+        def __init__(self, num_classes=3):
+            super().__init__()
+            self.img = timm.create_model("convnext_tiny", pretrained=True, num_classes=0)
+            # compute d_img dynamically (safe since torch exists)
+            with torch.no_grad():
+                d_img = self.img(torch.zeros(1,3,CONV_IMG_SIZE,CONV_IMG_SIZE)).shape[-1]
+            self.txt = AutoModel.from_pretrained("distilbert-base-uncased")
+            d_txt = self.txt.config.hidden_size
+            self.txt_ln = nn.LayerNorm(d_txt)
+            self.head = nn.Sequential(
+                nn.Linear(d_img + d_txt, 256),
+                nn.GELU(),
+                nn.Dropout(0.3),
+                nn.Linear(256,64),
+                nn.GELU(),
+                nn.Linear(64, num_classes)
+            )
+        def forward(self, ids, mask, img):
+            i = self.img(img)
+            t = self.txt(input_ids=ids, attention_mask=mask).last_hidden_state[:,0]
+            t = self.txt_ln(t)
+            return self.head(torch.cat([i, t], dim=1))
+else:
+    # placeholder classes if torch missing to avoid NameError on references (they won't be used)
+    T1_FUSION = T2Text = T3T4 = None
 
 # ---------------------------
 # Instantiate models and load weights (attempt)
@@ -190,7 +206,10 @@ if "torch" in globals():
 
         # tokenizers
         try:
-            t1_tok = RobertaTokenizerFast.from_pretrained("distilroberta-base")
+            if RobertaTokenizerFast is not None:
+                t1_tok = RobertaTokenizerFast.from_pretrained("distilroberta-base", use_fast=True)
+            else:
+                t1_tok = AutoTokenizer.from_pretrained("distilroberta-base", use_fast=True)
         except Exception:
             t1_tok = AutoTokenizer.from_pretrained("distilroberta-base", use_fast=True)
         t2_tok = AutoTokenizer.from_pretrained("distilbert-base-uncased", use_fast=True)
@@ -221,12 +240,11 @@ if "torch" in globals():
             if m is not None:
                 m.eval()
 
-        # check if at least tokenizers exist
-        MODELS_AVAILABLE = True
+        # check if tokenizers and models exist
+        MODELS_AVAILABLE = all(x is not None for x in (t1, t2, t3, t4, t1_tok, t2_tok))
     except Exception as e:
         MODELS_AVAILABLE = False
 
-# If torch not available or instantiation failed, we'll use stubs later
 # ---------------------------
 # Helper: text encoding
 # ---------------------------
@@ -327,19 +345,22 @@ def call_openrouter_valid(api_key: str, messages: List[Dict[str,str]], model: st
 def sanitize_raw_text(text: str) -> str:
     if text is None:
         return ""
-    # Remove common markdown tokens and artifacts
-    # remove bold/italic markers and code fences and headings
-    text = re.sub(r"(```[\s\S]*?```)", "", text)  # remove code fences
-    text = text.replace("**", "").replace("__", "").replace("*", "")
+    # Remove code fences first
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    # Remove markdown-like tokens but be conservative to keep sentences
+    text = text.replace("**", "").replace("__", "")
+    # Remove standalone asterisks used for emphasis or bullets (but keep multiplication asterisks unlikely here)
+    text = re.sub(r"(?m)^\s*\*\s*", "", text)
     text = text.replace("`", "")
-    text = re.sub(r"^#+\s*", "", text, flags=re.MULTILINE)  # headings
-    text = text.replace("-", "")  # remove dashes often used in lists
-    text = text.replace("•", "")
-    text = text.replace("•", "")
-    text = re.sub(r"\[\^?\d+\]", "", text)  # footnote markers
-    # Remove markdown links but keep text: [text](url) -> text
+    # Remove leading heading markers
+    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
+    # Remove common bullet characters at start of lines
+    text = re.sub(r"(?m)^[\-\u2022]\s*", "", text)
+    # Replace markdown links [text](url) -> text
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-    # Strip excessive whitespace
+    # Remove footnote markers like [1], [^1]
+    text = re.sub(r"\[\^?\d+\]", "", text)
+    # Collapse excessive whitespace
     text = re.sub(r"[ \t]{2,}", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
@@ -351,11 +372,17 @@ st.title("CrisisMMD 4-task assistant — Integrated models + OpenRouter (Raw Tex
 
 with st.sidebar:
     st.header("API & Model Settings")
-    # secret from Streamlit
-    secret_api = st.secrets.get("OPENROUTER_API_KEY", "")
+    # Use secrets: user should put OPENROUTER_API_KEY into Streamlit secrets.toml
+    secret_api = ""
+    try:
+        # st.secrets may raise if not configured; use .get safely
+        secret_api = st.secrets.get("OPENROUTER_API_KEY", "")
+    except Exception:
+        secret_api = os.environ.get("OPENROUTER_API_KEY", "")
     st.write("Secret API available:", bool(secret_api))
     sidebar_key = st.text_input("OpenRouter API key (optional override)", type="password")
-    selected_model = st.selectbox("OpenRouter model", [DEFAULT_LLM_MODEL, "gpt-4o-mini", "gpt-4o"])
+    # ensure qwen is the default first option
+    selected_model = st.selectbox("OpenRouter model", [DEFAULT_LLM_MODEL, "gpt-4o-mini", "gpt-4o"], index=0)
     temp = st.slider("Temperature", 0.0, 1.0, 0.2)
     max_tokens = st.number_input("Max tokens", 64, 2048, 512)
 
@@ -372,7 +399,7 @@ with col2:
     if IMPORT_ERROR_MSG:
         st.write("Optional import errors (ignored):")
         st.code(IMPORT_ERROR_MSG)
-    # show whether model weights were loaded
+    # show whether model weights were found on disk (informational)
     mw_status = {
         "t1": os.path.exists(T1_PATH),
         "t2": os.path.exists(T2_PATH),
@@ -389,7 +416,7 @@ mask_infos = []
 if uploaded_image:
     try:
         pil_img = Image.open(uploaded_image).convert("RGB")
-        st.image(pil_img, caption="Uploaded image", use_column_width=True)
+        st.image(pil_img, caption="Uploaded image", use_container_width=True)
     except Exception as e:
         st.error("Could not read uploaded image: " + str(e))
 
@@ -398,7 +425,7 @@ if uploaded_masks:
         try:
             mi = Image.open(m).convert("L")
             mask_infos.append({"name": getattr(m, "name", "mask"), "size": mi.size})
-            st.image(mi, caption=f"Mask: {getattr(m,'name','mask')}", use_column_width=True)
+            st.image(mi, caption=f"Mask: {getattr(m,'name','mask')}", use_container_width=True)
         except Exception as e:
             st.warning(f"Could not open mask {getattr(m,'name','')}: {e}")
 
@@ -406,9 +433,9 @@ if uploaded_masks:
 # Run inference & call OpenRouter
 # ---------------------------
 if st.button("Run models and get response"):
-    api_key = sidebar_key.strip() or secret_api or os.environ.get("OPENROUTER_API_KEY","")
+    api_key = (sidebar_key.strip() or secret_api or os.environ.get("OPENROUTER_API_KEY","")).strip()
     if not api_key:
-        st.error("OpenRouter API key missing. Add to Streamlit secrets or paste in sidebar.")
+        st.error("OpenRouter API key missing. Add to Streamlit secrets (OPENROUTER_API_KEY) or paste in sidebar.")
         st.stop()
     if pil_img is None:
         st.error("Please upload an image.")
@@ -432,7 +459,7 @@ if st.button("Run models and get response"):
     prompt_lines.append("Segmentation masks summary:")
     if mask_infos:
         for mi in mask_infos:
-            prompt_lines.append(f"- {mi.get('name','mask')} size {mi.get('size')}")
+            prompt_lines.append(f"{mi.get('name','mask')} size {mi.get('size')}")
     else:
         prompt_lines.append("(no masks provided)")
     prompt_lines.append("")
@@ -453,7 +480,7 @@ if st.button("Run models and get response"):
     system_msg = (
         "You are an assistant specialized in crisis/social media multimodal analysis. "
         "Respond ONLY in raw plain text. Do not use markdown, headings, bullets, numbering, symbols, emojis, or formatting of any kind. "
-        "No asterisks, no hashes, no hyphens, no code blocks. Output must be plain sentences separated only by newlines."
+        "No asterisks, no hashes, no hyphens for list markers, no code blocks. Output must be plain sentences separated only by newlines."
     )
 
     messages = [
@@ -468,7 +495,13 @@ if st.button("Run models and get response"):
         st.subheader("Assistant response (raw text)")
         st.text_area("Response (raw)", llm_text, height=400)
     except requests.exceptions.HTTPError as he:
-        st.error(f"OpenRouter HTTP error: {he} - {getattr(he.response,'text', '')}")
+        # show both status and server text if available
+        server_text = ""
+        try:
+            server_text = he.response.text
+        except Exception:
+            server_text = ""
+        st.error(f"OpenRouter HTTP error: {he} - {server_text}")
     except Exception as e:
         st.error("OpenRouter error: " + str(e))
 
