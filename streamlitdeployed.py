@@ -80,9 +80,7 @@ try:
             on=["tweet_id","tweet_text","image"]
         )
     ).sample(10).reset_index(drop=True)
-    print(f"
-🔹 Loaded {len(eval_df)} aligned multimodal samples
-")
+    print(f"\n🔹 Loaded {len(eval_df)} aligned multimodal samples\n"")
 except Exception as e:
     print("Could not load local dataset (continuing). Error:", e)
     eval_df = None
@@ -392,7 +390,7 @@ if st.button("Run models and generate response"):
                     for i, out in enumerate(outputs):
                         user_lines.append(f"Output {i+1}: {out}")
 
-                user_content = "
+                user_content = ""
 ".join(user_lines)
                 messages = [
                     {"role": "system", "content": system_msg},
@@ -415,7 +413,7 @@ if st.button("Run models and generate response"):
                         if st.checkbox("Also request structured JSON (extra call)"):
                             fu = [
                                 {"role": "system", "content": "You are an assistant that returns ONLY valid JSON as a single object in your content."},
-                                {"role": "user", "content": "Based on the previous messages, return a single JSON object with keys: summary, suggested_hashtags (array), short_reply (string), instructions_for_public (string), metadata (object)."}
+                                {"role": "user", "content": ""Based on the previous messages, return a single JSON object with keys: summary, suggested_hashtags (array), short_reply (string), instructions_for_public (string), metadata (object)."}
                             ]
                             fu = messages + fu
                             fu_res = call_openrouter(api_key=api_key, prompt_messages=fu, model=model_name, max_tokens=512, temperature=0.0)
