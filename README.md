@@ -23,7 +23,7 @@ This repo is a step in that direction: a **5-model system** trained on CrisisMMD
 
 ## 🧠 Model Suite
 
-> All text encoders use **DistilBERT**, and all image encoders use **ConvNeXt-Tiny** unless otherwise noted.
+> task T2, T3 and T4 use **DistilBERT**, and the image encoders for T3 and T4 use **ConvNeXt-Tiny** unless otherwise noted.
 
 | Model                                | Input                     | Output                          | Purpose                                     |
 | ------------------------------------ | ------------------------- | ------------------------------- | ------------------------------------------- |
@@ -40,8 +40,8 @@ This repo is a step in that direction: a **5-model system** trained on CrisisMMD
 ### **T1 – Fusion Relevance**
 
 * **Inputs:** tweet text + associated image
-* **Text branch:** DistilBERT → CLS vector (768-dim) → LayerNorm
-* **Image branch:** ConvNeXt-Tiny → pooled feature (e.g., 768-dim)
+* **Text branch:** DistilRoBERTa → CLS vector (768-dim) → LayerNorm
+* **Image branch:** ViT-B32 → pooled feature (e.g., 768-dim)
 * **Fusion:** concatenation `[img, text] → Linear → GELU → Linear → logits(2)`
 * **Training objective:** weighted cross-entropy with class weights from CrisisMMD label distribution
 * **Use:** screen out non-informative posts early in the pipeline.
